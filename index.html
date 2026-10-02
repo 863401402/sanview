@@ -14,7 +14,7 @@
 <meta property="og:image" content="https://863401402.github.io/sanview/assets/screenshots/desktop.png">
 <title>积木三视图实验室</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="css/style.css?v=20261002.1">
+<link rel="stylesheet" href="css/style.css?v=20261003.1">
 </head>
 <body>
 <a class="skip-link" href="#workspace">跳到操作区</a>
@@ -30,7 +30,7 @@
     <button class="tab" data-mode="practice" aria-pressed="false">动手练习</button>
     <button class="tab" data-mode="build" aria-pressed="false">自由搭建</button>
   </nav>
-  <button class="help-btn" id="help-btn" type="button" title="打开新手教程" aria-label="打开新手教程">?</button>
+  <button class="help-btn" id="help-btn" type="button" title="打开使用帮助" aria-label="打开使用帮助">使用帮助</button>
 </header>
 
 <section class="learning-strip" aria-labelledby="mission-title">
@@ -38,6 +38,7 @@
     <p class="learning-eyebrow">三视图 · 空间探索<span>看立体 · 画投影 · 搭模型</span></p>
     <h1 id="mission-title">从不同方向，读懂一个模型</h1>
     <p id="mission-description">切换前、左、上，观察三幅投影如何对应。</p>
+    <button class="intro-start" id="intro-start" type="button" aria-controls="intro-guide" aria-expanded="false">第一次用？看懂三视图</button>
     <details class="parent-guide">
       <summary>讲解提示（家长 / 老师）</summary>
       <p id="parent-prompt">先问孩子：从前面看，会看到什么形状？再切换视角一起验证。</p>
@@ -51,7 +52,6 @@
       <button id="progress-reset" type="button" class="text-button">清除记录</button>
     </div>
   </div>
-  <p id="workspace-status" role="status" aria-live="polite" aria-atomic="true"></p>
   <input id="build-file-input" type="file" accept=".json,application/json" hidden>
 </section>
 
@@ -63,16 +63,28 @@
         <div><strong>立体模型</strong><small>拖动转一转，看看不同方向</small></div>
       </div>
       <button class="size-toggle" id="size-toggle" type="button" aria-expanded="false" aria-controls="size-form">
-        <span>方格边长</span><strong>4</strong><i aria-hidden="true"></i>
+        <span>空间</span><strong>4</strong><i aria-hidden="true"></i>
       </button>
       <div class="practice-switcher-slot" id="practice-switcher-slot" hidden></div>
       <div class="hint" id="hint" aria-live="polite"></div>
       <div class="stage-actions">
-        <button id="section-toggle" title="开启剖切" aria-label="开启剖切" aria-pressed="false"><span aria-hidden="true">剖</span></button>
+        <button id="section-toggle" title="开启剖切" aria-label="开启剖切" aria-pressed="false"><span aria-hidden="true">剖切</span></button>
         <button id="sound-btn" title="关闭声音" aria-label="关闭声音">◖))</button>
         <button id="fullscreen-btn" title="全屏显示" aria-label="全屏显示">⛶</button>
       </div>
     </div>
+    <section class="intro-guide" id="intro-guide" aria-labelledby="intro-title" hidden>
+      <div class="intro-copy">
+        <p class="intro-step" id="intro-step">1 / 3 · 看一个方向</p>
+        <h2 id="intro-title">从前面看，就是正视图</h2>
+        <p id="intro-description">对照模型与正视图，看看哪些积木在这个方向重叠了。</p>
+      </div>
+      <div class="intro-controls">
+        <button id="intro-prev" type="button" class="tbtn ghost">上一步</button>
+        <button id="intro-next" type="button" class="tbtn teal">下一步</button>
+        <button id="intro-close" type="button" class="text-button">结束演示</button>
+      </div>
+    </section>
     <div class="size-form" id="size-form" hidden>
       <div class="size-form-title"><b>设置方格边长</b><button type="button" id="size-close" aria-label="关闭">×</button></div>
       <div class="size-options" role="group" aria-label="选择空间边长">
@@ -118,19 +130,21 @@
 
     <!-- 视角控制（学习/搭建用） -->
     <div class="view-btns" id="view-btns" role="group" aria-label="观察方向">
-      <button class="vb" data-view="front" aria-pressed="false" aria-label="从前面观察">前</button>
-      <button class="vb" data-view="left" aria-pressed="false" aria-label="从左面观察">左</button>
-      <button class="vb" data-view="top" aria-pressed="false" aria-label="从上面观察">上</button>
+      <button class="vb" data-view="front" aria-pressed="false" aria-label="从前面观察">从前看</button>
+      <button class="vb" data-view="left" aria-pressed="false" aria-label="从左面观察">从左看</button>
+      <button class="vb" data-view="top" aria-pressed="false" aria-label="从上面观察">从上看</button>
       <button class="vb active" data-view="iso" aria-pressed="true">立体</button>
     </div>
+    <a class="go-projections" href="#projection-panel">查看三视图与作答区 ↓</a>
 
     <!-- 模式工具栏 -->
     <div class="stage-toolbar" id="stage-toolbar"></div>
+    <p id="workspace-status" role="status" aria-live="polite" aria-atomic="true"></p>
 
   </section>
 
   <!-- 三视图面板 -->
-  <aside class="views-panel" aria-label="三个方向的投影">
+  <aside class="views-panel" id="projection-panel" tabindex="-1" aria-label="三个方向的投影">
     <div class="panel-heading">
       <div><strong>同一个模型，三个方向</strong><small>正视图 · 左视图 · 俯视图</small></div>
     </div>
@@ -170,6 +184,8 @@
       </div>
       <div class="view-info" id="info-top"></div>
     </div>
+    <div class="projection-actions" id="projection-actions" role="group" aria-label="检查与修改作答" hidden></div>
+    <p class="projection-status" id="projection-status"></p>
   </aside>
 </main>
 
@@ -183,6 +199,6 @@
 <script src="js/voice-library.js?v=20261002.1"></script>
 <script src="js/model-library.js?v=20261002.1"></script>
 <script src="js/learning-state.js?v=20261002.1"></script>
-<script src="js/app.js?v=20261002.1"></script>
+<script src="js/app.js?v=20261003.1"></script>
 </body>
 </html>

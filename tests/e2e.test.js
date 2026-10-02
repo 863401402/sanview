@@ -83,9 +83,36 @@ async function drawCurrentAnswer(page) {
   var state = await debugState(page);
   for (var view of ['front', 'left', 'top']) {
     for (var index = 0; index < state.views[view].length; index++) {
-      if (state.views[view][index] !== null) await page.locator('#grid-' + view + ' .cell').nth(index).click();
+      var cell = page.locator('#grid-' + view + ' .cell').nth(index);
+      var filled = await cell.getAttribute('aria-pressed') === 'true';
+      if (filled !== (state.views[view][index] !== null)) await cell.click();
     }
   }
+}
+
+async function drawingSnapshot(page) {
+  return page.evaluate(function () {
+    var result = {};
+    ['front', 'left', 'top'].forEach(function (view) {
+      result[view] = Array.from(document.getElementById('grid-' + view).children).map(function (cell) {
+        return {
+          filled: cell.classList.contains('filled'),
+          classes: cell.className,
+          style: cell.getAttribute('style'),
+          pressed: cell.getAttribute('aria-pressed')
+        };
+      });
+    });
+    return result;
+  });
+}
+
+function drawnMasks(snapshot) {
+  var result = {};
+  ['front', 'left', 'top'].forEach(function (view) {
+    result[view] = snapshot[view].map(function (cell) { return cell.filled; });
+  });
+  return result;
 }
 
 async function importModel(page, value) {
@@ -103,10 +130,75 @@ async function noHorizontalOverflow(page, description) {
   assert.ok(overflow.scroll <= overflow.client + 1, description + ' has no document horizontal overflow');
 }
 
+async function confirmAction(page, action, accept) {
+  var response = page.waitForEvent('dialog').then(async function (dialog) {
+    assert.strictEqual(dialog.type(), 'confirm', 'discarding an unfinished drawing asks for confirmation');
+    if (accept) await dialog.accept();
+    else await dialog.dismiss();
+  });
+  await Promise.all([response, action()]);
+}
+
+async function acceptDiscard(page, action) {
+  var responses = [], unexpectedType = null;
+  function onDialog(dialog) {
+    if (dialog.type() !== 'confirm') unexpectedType = dialog.type();
+    responses.push(dialog.accept());
+  }
+  page.on('dialog', onDialog);
+  try {
+    await action();
+    await Promise.all(responses);
+    assert.strictEqual(unexpectedType, null, 'intentional navigation only asks for discard confirmation');
+    return responses.length;
+  } finally {
+    page.removeListener('dialog', onDialog);
+  }
+}
+
+async function enterWorkspaceFullscreen(page) {
+  await page.locator('#fullscreen-btn').click();
+  await page.waitForFunction(function () {
+    var workspace = document.getElementById('workspace');
+    return document.fullscreenElement === workspace || workspace.classList.contains('is-expanded');
+  });
+  var correctTarget = await page.evaluate(function () {
+    var workspace = document.getElementById('workspace');
+    return document.fullscreenElement ? document.fullscreenElement === workspace : workspace.classList.contains('is-expanded');
+  });
+  assert.strictEqual(correctTarget, true, 'fullscreen contains the entire workspace, including the projection panel');
+}
+
+async function exitWorkspaceFullscreen(page) {
+  await page.locator('#fullscreen-btn').click();
+  await page.waitForFunction(function () {
+    return !document.fullscreenElement && !document.getElementById('workspace').classList.contains('is-expanded');
+  });
+}
+
+async function revealLastColumn(cell, requireInnerScroll) {
+  await cell.scrollIntoViewIfNeeded();
+  var scrolls = await cell.evaluate(function (element) {
+    var moved = [];
+    for (var parent = element.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
+      if (!/auto|scroll/.test(getComputedStyle(parent).overflowX) || parent.scrollWidth <= parent.clientWidth + 1) continue;
+      parent.scrollLeft = 0;
+      var before = parent.scrollLeft;
+      parent.scrollBy({ left: parent.scrollWidth, top: 0, behavior: 'instant' });
+      moved.push({ before: before, after: parent.scrollLeft, width: parent.clientWidth, contentWidth: parent.scrollWidth });
+    }
+    return moved;
+  });
+  if (requireInnerScroll) assert.ok(scrolls.length > 0, 'the narrow layout exposes an inner horizontal scroller for all eight columns');
+  assert.ok(scrolls.every(function (scroll) { return scroll.after > scroll.before; }), 'inner horizontal scrolling actually moves to the last column: ' + JSON.stringify(scrolls));
+  await cell.tap();
+  return scrolls.length;
+}
+
 async function run() {
   fs.mkdirSync(ARTIFACTS, { recursive: true });
   var localServer = null;
-  var browser = null, page = null, mobile = null;
+  var browser = null, page = null, mobile = null, layoutPages = [];
   try {
   if (!BASE_URL) {
     localServer = await startServer({ port: 0 });
@@ -138,6 +230,19 @@ async function run() {
   await page.keyboard.press('Escape');
   assert.strictEqual(await page.locator('#overlay').isVisible(), false, 'the on-demand tutorial closes with Escape');
   assert.strictEqual(await page.locator('#help-btn').evaluate(function (button) { return document.activeElement === button; }), true, 'closing the tutorial returns focus to help');
+  var introModel = cubeCoordinates(await debugState(page));
+  await page.locator('#intro-start').click();
+  assert.strictEqual(await page.locator('#intro-next').isVisible(), true, 'the optional introduction exposes its own next control');
+  assert.strictEqual(await page.locator('#overlay').isVisible(), false, 'the introduction leaves the workspace available instead of opening a modal');
+  assert.strictEqual(await page.locator('#three-container').isVisible(), true);
+  await page.screenshot({ path: path.join(ARTIFACTS, 'intro-desktop.png'), fullPage: true });
+  await page.locator('#intro-next').click();
+  assert.deepStrictEqual(cubeCoordinates(await debugState(page)), introModel, 'advancing the introduction preserves the current model');
+  await page.locator('#intro-prev').click();
+  assert.deepStrictEqual(cubeCoordinates(await debugState(page)), introModel, 'going back in the introduction preserves the current model');
+  await page.locator('#intro-close').click();
+  assert.strictEqual(await page.locator('#intro-next').isVisible(), false, 'the introduction can be dismissed without completing it');
+  assert.deepStrictEqual(cubeCoordinates(await debugState(page)), introModel);
   await waitForCamera(page);
 
   var state = await debugState(page);
@@ -220,24 +325,85 @@ async function run() {
   assert.deepStrictEqual(cubeCoordinates(await debugState(page)), observedModel, 'practice starts with the exact model shown in observation');
   assert.strictEqual(await page.locator('body').getAttribute('data-mode'), 'practice');
   assert.strictEqual(await page.locator('body').getAttribute('data-practice-mode'), 'draw');
+  assert.strictEqual(await page.locator('#view-btns').isVisible(), false, 'practice does not reveal aligned directions by default');
+  assert.strictEqual(await page.locator('aside #projection-actions #practice-check').count(), 1, 'drawing actions sit next to the projection grids');
+  assert.strictEqual(await page.locator('.stage #workspace-status').count(), 1, 'workspace feedback stays with the model');
   assert.strictEqual(await page.locator('#practice-difficulty').textContent(), '简单', 'drawing starts at the simplest difficulty');
   assert.strictEqual(await page.locator('[data-difficulty="practice-difficulty"][data-step="-1"]').isDisabled(), true, 'the simplest difficulty cannot wrap backwards');
   assert.strictEqual(await page.locator('#grid-front .cell').count(), 16);
   var summary = await progressSummary(page);
+  var initialPracticeLayout = await page.evaluate(function () {
+    var panel = document.getElementById('projection-panel').getBoundingClientRect();
+    return ['card-front', 'card-left', 'card-top', 'projection-actions'].every(function (id) {
+      var rect = document.getElementById(id).getBoundingClientRect();
+      return rect.top >= panel.top - 1 && rect.bottom <= Math.min(panel.bottom, window.innerHeight) + 1;
+    });
+  });
+  assert.strictEqual(initialPracticeLayout, true, 'the default desktop practice fits all three drawings and the check controls beside the model');
   assert.strictEqual(summary.attempted, 0, 'a new browser starts with no learning record');
   await page.locator('#practice-check').click();
   await page.locator('#practice-check').click();
   summary = await progressSummary(page);
   assert.strictEqual(summary.attempted, 1, 'repeated checks count one attempted question');
   assert.strictEqual(summary.solved, 0, 'an empty drawing is not solved');
+  var partialAnswer = await debugState(page);
+  for (var partialView of ['front', 'left', 'top']) {
+    var correctCell = partialAnswer.views[partialView].findIndex(function (value) { return value !== null; });
+    assert.ok(correctCell >= 0, 'the current projection contains a cube');
+    await page.locator('#grid-' + partialView + ' .cell').nth(correctCell).click();
+  }
+  var extraCell = partialAnswer.views.front.findIndex(function (value) { return value === null; });
+  assert.ok(extraCell >= 0, 'the sample model has an empty cell for the feedback test');
+  await page.locator('#grid-front .cell').nth(extraCell).click();
+  await page.locator('#practice-check').click();
+  var beforeReference = await drawingSnapshot(page);
+  assert.ok(beforeReference.front.some(function (cell) { return cell.classes.includes('wrong'); }), 'the partial drawing has existing correction feedback');
+  var beforeCancelledChange = await debugState(page);
+  await page.locator('#size-toggle').click();
+  await confirmAction(page, function () { return page.locator('.size-options [data-size="3"]').click(); }, false);
+  assert.deepStrictEqual((await debugState(page)).dimensions, beforeCancelledChange.dimensions, 'cancelling a resize keeps the original question dimensions');
+  assert.deepStrictEqual(cubeCoordinates(await debugState(page)), cubeCoordinates(beforeCancelledChange), 'cancelling a resize keeps the question model');
+  assert.deepStrictEqual(await drawingSnapshot(page), beforeReference, 'cancelling a resize keeps every drawing and feedback mark');
+  if (await page.locator('#size-form').isVisible()) await page.locator('#size-close').click();
+  await confirmAction(page, function () { return page.locator('button[data-mode="build"]').click(); }, false);
+  assert.strictEqual((await debugState(page)).mode, 'practice', 'cancelling a mode change keeps the practice session open');
+  assert.strictEqual(await page.locator('body').getAttribute('data-practice-mode'), 'draw');
+  assert.deepStrictEqual(await drawingSnapshot(page), beforeReference, 'cancelling a mode change preserves the unfinished drawing');
+  var workspaceFeedback = await page.locator('#workspace-status').textContent();
+  assert.ok(workspaceFeedback.trim().length > 0, 'the model shows useful feedback');
+  assert.strictEqual(await page.locator('#projection-status').textContent(), workspaceFeedback, 'the projection area mirrors the same feedback');
+  await page.screenshot({ path: path.join(ARTIFACTS, 'desktop-practice.png'), fullPage: true });
   await page.locator('#practice-answer').click();
-  assert.ok(await page.locator('.view-grid .cell.filled').count() > 0, 'answer reveals projected cells');
+  assert.strictEqual(await page.locator('#overlay [role="dialog"]').isVisible(), true, 'reference answers open in a separate dialog');
+  assert.strictEqual(await page.locator('#answer-close').isVisible(), true);
+  var answerText = await page.locator('#overlay [role="dialog"]').textContent();
+  ['正视图', '左视图', '俯视图'].forEach(function (name) { assert.ok(answerText.includes(name), 'reference answers label ' + name); });
+  assert.strictEqual(await page.locator('#overlay .answer-layout').count(), 1, 'reference grids are separate from the editable drawing grids');
+  for (var answerView of ['front', 'left', 'top']) {
+    var referenceMask = await page.locator('#overlay .answer-view[data-view="' + answerView + '"] .answer-cell').evaluateAll(function (cells) {
+      return cells.map(function (cell) { return cell.classList.contains('filled'); });
+    });
+    assert.deepStrictEqual(referenceMask, partialAnswer.views[answerView].map(function (value) { return value !== null; }), 'the reference dialog shows the correct ' + answerView + ' projection');
+  }
+  assert.deepStrictEqual(await drawingSnapshot(page), beforeReference, 'opening reference answers changes neither the drawing nor its feedback');
+  await page.locator('#answer-close').click();
+  assert.deepStrictEqual(await drawingSnapshot(page), beforeReference, 'closing reference answers preserves every drawing cell and feedback mark');
+  assert.strictEqual(await page.locator('#practice-answer').evaluate(function (button) { return document.activeElement === button; }), true, 'reference close returns focus to its trigger');
+  await page.locator('#practice-check').click();
+  assert.strictEqual(await page.locator('#overlay').isVisible(), false, 'checking after reference answers still evaluates the incomplete personal drawing');
+  assert.strictEqual((await progressSummary(page)).solved, 0, 'viewing a reference answer does not solve a question');
+  var beforeClear = drawnMasks(await drawingSnapshot(page));
+  await page.locator('#practice-clear').click();
+  assert.strictEqual(await page.locator('#grid-front .filled, #grid-left .filled, #grid-top .filled').count(), 0, 'clear removes all three drawings');
+  await page.locator('#practice-undo-clear').click();
+  assert.deepStrictEqual(drawnMasks(await drawingSnapshot(page)), beforeClear, 'undo clear restores the same question in all three views');
+  await drawCurrentAnswer(page);
   await page.locator('#practice-check').click();
   await page.waitForSelector('#overlay.show');
   summary = await progressSummary(page);
   assert.strictEqual(summary.attempted, 1);
   assert.strictEqual(summary.solved, 1);
-  assert.strictEqual(summary.independent, 0, 'a revealed answer is never counted as independently solved');
+  assert.strictEqual(summary.independent, 0, 'a question completed after consulting reference answers is not counted independently');
   var dialogButtons = page.locator('#overlay [role="dialog"] button');
   await dialogButtons.last().focus();
   await page.keyboard.press('Tab');
@@ -248,9 +414,23 @@ async function run() {
   await page.locator('#practice-check').click();
   await page.locator('#win-close').click();
   assert.deepStrictEqual(await progressSummary(page), summary, 'checking a completed question does not duplicate the result');
+  await enterWorkspaceFullscreen(page);
+  assert.strictEqual(await page.locator('#workspace #projection-panel').isVisible(), true, 'fullscreen practice retains the projection panel');
+  assert.strictEqual(await page.locator('#projection-actions #practice-check').isVisible(), true, 'fullscreen practice retains its check action');
+  await page.locator('#practice-answer').click();
+  assert.strictEqual(await page.locator('#overlay .answer-layout').isVisible(), true, 'reference answers remain accessible from fullscreen practice');
+  await page.locator('#answer-close').click();
+  await page.locator('#practice-check').click();
+  await page.locator('#win-close').click();
+  assert.deepStrictEqual(await progressSummary(page), summary, 'fullscreen answer and check actions retain the existing question record');
+  await exitWorkspaceFullscreen(page);
+  assert.ok((await page.locator('#projection-tabs button[data-projection="front"]').textContent()).includes('✓'), 'a checked matching view displays its completion marker');
+  var completedFrontCell = (await debugState(page)).views.front.findIndex(function (value) { return value !== null; });
+  await page.locator('#grid-front .cell').nth(completedFrontCell).click();
+  assert.strictEqual((await page.locator('#projection-tabs button[data-projection="front"]').textContent()).includes('✓'), false, 'editing a matched view removes its stale completion marker');
   await page.locator('#practice-clear').click();
   assert.strictEqual(await page.locator('.view-grid .cell.filled').count(), 0, 'clear removes the drawing');
-  await page.locator('#practice-new').click();
+  await acceptDiscard(page, function () { return page.locator('#practice-new').click(); });
   await drawCurrentAnswer(page);
   await page.locator('#practice-check').click();
   await page.locator('#win-close').click();
@@ -258,13 +438,28 @@ async function run() {
   assert.strictEqual(summary.attempted, 2);
   assert.strictEqual(summary.solved, 2);
   assert.strictEqual(summary.independent, 1, 'a new question completed without revealing its answer counts independently');
+  var completedQuestionDialogs = await acceptDiscard(page, function () { return page.locator('#practice-new').click(); });
+  assert.strictEqual(completedQuestionDialogs, 0, 'a completed question can move on without a discard prompt');
+  assert.strictEqual(await page.locator('#view-btns').isVisible(), false, 'a fresh question starts without direction assistance');
+  await page.locator('#practice-assist').click();
+  assert.strictEqual(await page.locator('#view-btns').isVisible(), true, 'direction assistance is an explicit choice');
+  await page.locator('#view-btns [data-view="front"]').click();
+  await drawCurrentAnswer(page);
+  await page.locator('#practice-check').click();
+  await page.locator('#win-close').click();
+  summary = await progressSummary(page);
+  assert.strictEqual(summary.attempted, 3);
+  assert.strictEqual(summary.solved, 3);
+  assert.strictEqual(summary.independent, 1, 'using direction assistance does not count as an independent solution');
+  await acceptDiscard(page, function () { return page.locator('#practice-new').click(); });
+  assert.strictEqual(await page.locator('#view-btns').isVisible(), false, 'new questions turn direction assistance off again');
   await page.reload({ waitUntil: 'networkidle' });
   await page.waitForFunction(function () { return !!window.SanviewDebug; });
   assert.deepStrictEqual(await progressSummary(page), summary, 'learning records survive a reload');
   await page.locator('button[data-mode="practice"]').click();
-  await page.locator('[data-difficulty="practice-difficulty"][data-step="1"]').click();
+  await acceptDiscard(page, function () { return page.locator('[data-difficulty="practice-difficulty"][data-step="1"]').click(); });
   assert.strictEqual(await page.locator('#practice-difficulty').textContent(), '中等');
-  await page.locator('[data-difficulty="practice-difficulty"][data-step="-1"]').click();
+  await acceptDiscard(page, function () { return page.locator('[data-difficulty="practice-difficulty"][data-step="-1"]').click(); });
   await page.waitForTimeout(800);
   assert.strictEqual(await page.locator('#practice-difficulty').textContent(), '简单');
   assert.strictEqual(await page.locator('[data-difficulty="practice-difficulty"][data-step="-1"]').isDisabled(), true, 'difficulty decrease is disabled at its lower boundary');
@@ -274,6 +469,7 @@ async function run() {
   state = await debugState(page);
   assert.strictEqual(state.practiceMode, 'challenge');
   assert.strictEqual(await page.locator('body').getAttribute('data-practice-mode'), 'challenge');
+  assert.strictEqual(await page.locator('button[data-practice-mode="challenge"]').evaluate(function (button) { return document.activeElement === button; }), true, 'switching practice type focuses the newly rendered active switcher button');
   assert.strictEqual(state.cubes.length, 0, 'restore-block challenge starts with an empty model');
   assert.ok(await page.locator('.view-grid .cell.filled').count() > 0, 'challenge displays target projections');
   assert.strictEqual(await page.locator('.build-cell').count(), 16, 'challenge reuses the precise build pad');
@@ -310,11 +506,20 @@ async function run() {
   assert.ok(cubeAt(state, 0, 1, 0));
   assert.deepStrictEqual(cubeAt(state, 0, 0, 0).world.map(function (v) { return Math.round(v * 10) / 10; }), [0.5, 0.5, 0.5], 'animation ends at the correct world center');
 
+  await page.locator('#tool-remove').click();
+  await page.locator('.build-cell').nth(0).click();
+  assert.strictEqual((await debugState(page)).cubes.length, 1, 'left-clicking the pad executes the selected remove tool');
+  assert.strictEqual((await debugState(page)).buildTool, 'remove', 'left-click does not silently change the selected tool');
+  await page.locator('#tool-add').click();
+  await page.locator('.build-cell').nth(0).click();
+  assert.strictEqual((await debugState(page)).cubes.length, 2, 'left-clicking the pad executes the selected add tool');
+
   await page.locator('.build-cell').nth(0).click({ button: 'right' });
   await page.waitForTimeout(280);
   state = await debugState(page);
   assert.ok(cubeAt(state, 0, 0, 0));
   assert.ok(!cubeAt(state, 0, 1, 0), 'pad removes the top cube in its exact column');
+  assert.strictEqual(state.buildTool, 'add', 'right-click removes temporarily without changing the selected add tool');
   await page.locator('#tool-undo').click();
   state = await debugState(page);
   assert.ok(cubeAt(state, 0, 1, 0), 'undo restores the prior structure');
@@ -354,6 +559,26 @@ async function run() {
   await page.waitForTimeout(430);
   state = await debugState(page);
   assert.ok(cubeAt(state, 2, 0, 3), 'clicking the front face adds in +Z');
+
+  await page.locator('#tool-remove').click();
+  var selectedTop = await page.evaluate(function () { return window.SanviewDebug.project(2.5, 2, 2.5); });
+  await page.mouse.click(selectedTop.x, selectedTop.y);
+  await page.waitForTimeout(280);
+  assert.ok(!cubeAt(await debugState(page), 2, 1, 2), 'left-clicking the 3D model executes the selected remove tool');
+  assert.strictEqual((await debugState(page)).buildTool, 'remove', '3D left-click preserves the selected tool');
+  await page.locator('#tool-add').click();
+  topFace = await page.evaluate(function () { return window.SanviewDebug.project(2.5, 1, 2.5); });
+  await page.mouse.click(topFace.x, topFace.y);
+  await page.waitForTimeout(430);
+  assert.ok(cubeAt(await debugState(page), 2, 1, 2), '3D left-click adds after explicitly choosing add');
+  selectedTop = await page.evaluate(function () { return window.SanviewDebug.project(2.5, 2, 2.5); });
+  await page.mouse.click(selectedTop.x, selectedTop.y, { button: 'right' });
+  await page.waitForTimeout(280);
+  assert.ok(!cubeAt(await debugState(page), 2, 1, 2), '3D right-click temporarily removes the selected cube');
+  assert.strictEqual((await debugState(page)).buildTool, 'add', '3D right-click leaves add selected');
+  await page.locator('#tool-undo').click();
+  state = await debugState(page);
+  assert.ok(cubeAt(state, 2, 1, 2), 'the temporary right-click action is undoable');
 
   var modelBeforeSave = cubeCoordinates(state);
   await page.locator('#build-save').click();
@@ -402,14 +627,22 @@ async function run() {
 
   var fullscreenButton = page.locator('#fullscreen-btn');
   if (await fullscreenButton.isVisible()) {
-    await fullscreenButton.click();
-    await page.waitForTimeout(250);
-    assert.ok(await page.evaluate(function () {
-      return !!document.fullscreenElement || document.querySelector('.stage').classList.contains('is-expanded');
-    }), 'stage enters native or compatible fullscreen');
-    await fullscreenButton.click();
-    await page.waitForTimeout(250);
-    assert.ok(await page.evaluate(function () { return !document.fullscreenElement; }), 'stage exits fullscreen');
+    await enterWorkspaceFullscreen(page);
+    await page.locator('#build-save').click();
+    var fullscreenFeedback = await page.locator('.stage #workspace-status').evaluate(function (status) {
+      var workspace = document.getElementById('workspace');
+      var activeRoot = document.fullscreenElement || (workspace.classList.contains('is-expanded') ? workspace : null);
+      var rect = status.getBoundingClientRect();
+      return {
+        text: status.textContent,
+        inside: !!activeRoot && activeRoot.contains(status),
+        visible: rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.left >= 0 && rect.bottom <= innerHeight && rect.right <= innerWidth
+      };
+    });
+    assert.ok(fullscreenFeedback.text.includes('保存'), 'saving in fullscreen produces a save confirmation');
+    assert.strictEqual(fullscreenFeedback.inside, true, 'save feedback belongs to the active fullscreen workspace');
+    assert.strictEqual(fullscreenFeedback.visible, true, 'fullscreen save feedback is visible within the viewport');
+    await exitWorkspaceFullscreen(page);
   }
 
   await page.locator('button[data-mode="learn"]').click();
@@ -456,6 +689,13 @@ async function run() {
   await mobile.locator('#learn-example').selectOption('stairs');
   var mobilePixels = await mobile.evaluate(function () { return window.SanviewDebug.canvasPixels(); });
   assert.ok(mobilePixels.visibleSamples > 50, 'mobile 3D canvas renders');
+  var mobileObservation = cubeCoordinates(await debugState(mobile));
+  for (var direction of ['front', 'left', 'top']) {
+    await mobile.locator('#view-btns [data-view="' + direction + '"]').tap();
+    assert.strictEqual(await mobile.locator('body').getAttribute('data-active-projection'), direction, 'mobile camera direction also selects its matching projection');
+    assert.strictEqual(await mobile.locator('#card-' + direction).isVisible(), true);
+    assert.deepStrictEqual(cubeCoordinates(await debugState(mobile)), mobileObservation, 'changing direction preserves the observed model');
+  }
   await noHorizontalOverflow(mobile, 'mobile observation');
   await mobile.locator('button[data-mode="build"]').tap();
   await mobile.waitForTimeout(800);
@@ -481,6 +721,8 @@ async function run() {
 
   await mobile.locator('button[data-mode="practice"]').tap();
   assert.strictEqual(await mobile.locator('body').getAttribute('data-practice-mode'), 'draw');
+  assert.strictEqual(await mobile.locator('#view-btns').isVisible(), false, 'mobile practice also starts without direction assistance');
+  assert.strictEqual(await mobile.locator('aside #projection-actions #practice-check').count(), 1, 'mobile drawing actions belong to the projection panel');
   assert.strictEqual(await mobile.locator('.view-grid button.cell').count(), 192, 'three mobile drawing grids each retain 64 cells in the document');
   assert.strictEqual(await mobile.locator('body').getAttribute('data-active-projection'), 'front', 'mobile drawing opens on the front projection');
   assert.strictEqual(await mobile.locator('.view-card:visible').count(), 1, 'mobile displays one projection at a time');
@@ -507,6 +749,12 @@ async function run() {
       return rect.top < window.innerHeight && rect.bottom > 0;
     });
     assert.deepStrictEqual(cubeCoordinates(await debugState(mobile)), mobilePracticeModel, 'returning to the model does not replace the current question');
+    await mobile.locator('.go-projections:visible').first().tap();
+    await mobile.waitForFunction(function () {
+      var rect = document.getElementById('projection-panel').getBoundingClientRect();
+      return rect.top < window.innerHeight && rect.bottom > 0;
+    });
+    assert.strictEqual(await mobile.locator('body').getAttribute('data-active-projection'), projection, 'returning to the projection panel keeps the selected view');
   }
   await mobile.locator('#projection-tabs button[data-projection="front"]').tap();
   assert.strictEqual(await mobile.locator('#grid-front .cell').nth(wrongFrontCell).getAttribute('aria-pressed'), 'true', 'front drawing survives visits to the other projections and the model');
@@ -514,9 +762,21 @@ async function run() {
   await mobile.locator('#practice-check').tap();
   assert.strictEqual(await mobile.locator('body').getAttribute('data-active-projection'), 'front', 'checking an incorrect drawing opens the first projection needing correction');
   assert.strictEqual(await mobile.locator('#card-front').isVisible(), true);
+  assert.strictEqual(await mobile.locator('#projection-status').textContent(), await mobile.locator('#workspace-status').textContent(), 'mobile model and drawing show the same correction feedback');
+  var mobileBeforeReference = await drawingSnapshot(mobile);
+  await mobile.locator('#practice-answer').tap();
+  assert.strictEqual(await mobile.locator('#answer-close').isVisible(), true);
+  await noHorizontalOverflow(mobile, 'mobile reference answer dialog');
+  await mobile.screenshot({ path: path.join(ARTIFACTS, 'answer-mobile.png'), fullPage: true });
+  await mobile.locator('#answer-close').tap();
+  assert.deepStrictEqual(await drawingSnapshot(mobile), mobileBeforeReference, 'mobile reference answers preserve the existing drawing and feedback');
   await noHorizontalOverflow(mobile, 'mobile 8 by 8 drawing');
   await mobile.screenshot({ path: path.join(ARTIFACTS, 'mobile-practice.png'), fullPage: true });
-  await mobile.locator('button[data-mode="build"]').tap();
+  await mobile.locator('#practice-assist').tap();
+  assert.strictEqual(await mobile.locator('#view-btns').isVisible(), true);
+  await mobile.locator('#view-btns [data-view="left"]').tap();
+  assert.strictEqual(await mobile.locator('body').getAttribute('data-active-projection'), 'left', 'mobile direction assistance selects the corresponding drawing view');
+  await acceptDiscard(mobile, function () { return mobile.locator('button[data-mode="build"]').tap(); });
   assert.strictEqual((await debugState(mobile)).cubes.length, 1, 'mobile mode changes preserve the free build');
   await mobile.locator('#build-pad-collapse').tap();
   await mobile.waitForFunction(function () { return document.getElementById('build-pad').getBoundingClientRect().width < 55; });
@@ -534,9 +794,54 @@ async function run() {
   await mobile.screenshot({ path: path.join(ARTIFACTS, 'mobile.png'), fullPage: true });
   assert.deepStrictEqual(mobileErrors, [], 'mobile browser has no console errors');
 
-  console.log('e2e tests passed');
+  for (var profile of [
+    { name: 'mobile-320', width: 320, height: 740 },
+    { name: 'tablet-768', width: 768, height: 1024 }
+  ]) {
+    var layoutContext = await browser.newContext({
+      viewport: { width: profile.width, height: profile.height },
+      deviceScaleFactor: 1,
+      isMobile: true,
+      hasTouch: true,
+      reducedMotion: 'reduce'
+    });
+    layoutContext.setDefaultTimeout(10000);
+    var layoutPage = await layoutContext.newPage();
+    layoutPages.push({ name: profile.name, page: layoutPage });
+    var layoutErrors = [];
+    layoutPage.on('pageerror', function (error) { layoutErrors.push(error.message); });
+    layoutPage.on('console', function (message) { if (message.type() === 'error') layoutErrors.push(message.text()); });
+    await layoutPage.goto(BASE_URL + '?test=1', { waitUntil: 'networkidle' });
+    await layoutPage.waitForFunction(function () { return !!window.SanviewDebug; });
+    await setSize(layoutPage, 8);
+    assert.strictEqual((await debugState(layoutPage)).mode, 'learn');
+    assert.deepStrictEqual((await debugState(layoutPage)).dimensions, [8, 8, 8]);
+    await noHorizontalOverflow(layoutPage, profile.name + ' 8 by 8 observation');
+
+    await layoutPage.locator('button[data-mode="build"]').tap();
+    await setSize(layoutPage, 8);
+    assert.strictEqual(await layoutPage.locator('.build-cell').count(), 64);
+    await noHorizontalOverflow(layoutPage, profile.name + ' 8 by 8 build before scrolling');
+    var innerScrollCount = await revealLastColumn(layoutPage.locator('.build-cell[data-x="7"][data-z="0"]'), false);
+    assert.ok(cubeAt(await debugState(layoutPage), 7, 0, 0), profile.name + ' last build column remains reachable by touch');
+    await noHorizontalOverflow(layoutPage, profile.name + ' 8 by 8 build after inner scrolling');
+
+    await layoutPage.locator('button[data-mode="practice"]').tap();
+    await setSize(layoutPage, 8);
+    assert.strictEqual(await layoutPage.locator('#grid-front .cell').count(), 64);
+    await noHorizontalOverflow(layoutPage, profile.name + ' 8 by 8 practice before scrolling');
+    innerScrollCount += await revealLastColumn(layoutPage.locator('#grid-front .cell').nth(7), false);
+    assert.strictEqual(await layoutPage.locator('#grid-front .cell').nth(7).getAttribute('aria-pressed'), 'true', profile.name + ' last drawing column remains reachable by touch');
+    if (profile.width === 320) assert.ok(innerScrollCount > 0, 'the 320px layout scrolls inside a grid to reach its last column');
+    await noHorizontalOverflow(layoutPage, profile.name + ' 8 by 8 practice after inner scrolling');
+    await layoutPage.screenshot({ path: path.join(ARTIFACTS, profile.name + '.png'), fullPage: true });
+    assert.deepStrictEqual(layoutErrors, [], profile.name + ' has no browser errors');
+    await layoutContext.close();
+  }
+
+  console.log('e2e tests passed (' + browser.version() + ')');
   } catch (error) {
-    for (var entry of [{ name: 'desktop', page: page }, { name: 'mobile', page: mobile }]) {
+    for (var entry of [{ name: 'desktop', page: page }, { name: 'mobile', page: mobile }].concat(layoutPages)) {
       if (entry.page && !entry.page.isClosed()) {
         try {
           await entry.page.screenshot({ path: path.join(ARTIFACTS, 'failure-' + entry.name + '.png'), fullPage: true, timeout: 5000 });
