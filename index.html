@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f4f1e9">
+<meta name="description" content="通过搭积木、转视角和绘制投影，理解正视图、左视图与俯视图。">
+<meta name="color-scheme" content="light">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:title" content="积木三视图实验室">
+<meta property="og:description" content="面向儿童的三视图观察、练习与自由搭建工具。">
+<meta property="og:image" content="sanview_learn_desktop.png">
+<title>积木三视图实验室</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css?v=20260901.1">
+</head>
+<body>
+<a class="skip-link" href="#workspace">跳到操作区</a>
+<noscript>积木三视图实验室需要启用 JavaScript 才能运行。</noscript>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="logo">积木三视图</span>
+    <span class="edition">空间实验室</span>
+  </div>
+  <nav class="mode-tabs" id="mode-tabs" aria-label="学习模式">
+    <button class="tab active" data-mode="learn" aria-pressed="true">观察</button>
+    <button class="tab" data-mode="practice" aria-pressed="false">练习</button>
+    <button class="tab" data-mode="build" aria-pressed="false">搭建</button>
+  </nav>
+  <button class="help-btn" id="help-btn" type="button" title="打开新手教程" aria-label="打开新手教程">?</button>
+</header>
+
+<main class="layout" id="workspace">
+  <!-- 3D 场景区 -->
+  <section class="stage">
+    <div class="stage-headbar">
+      <div class="stage-heading">
+        <div><strong>立体模型</strong><small>X 向右 · Y 向上 · Z 向前</small></div>
+      </div>
+      <button class="size-toggle" id="size-toggle" type="button" aria-expanded="false" aria-controls="size-form">
+        <span>空间</span><strong>4</strong><i aria-hidden="true"></i>
+      </button>
+      <div class="practice-switcher-slot" id="practice-switcher-slot" hidden></div>
+      <div class="hint" id="hint" aria-live="polite"></div>
+      <div class="stage-actions">
+        <button id="section-toggle" title="开启剖切" aria-label="开启剖切" aria-pressed="false"><span aria-hidden="true">剖</span></button>
+        <button id="sound-btn" title="关闭声音" aria-label="关闭声音">◖))</button>
+        <button id="fullscreen-btn" title="全屏显示" aria-label="全屏显示">⛶</button>
+      </div>
+    </div>
+    <div class="size-form" id="size-form" hidden>
+      <div class="size-form-title"><b>自定义空间</b><button type="button" id="size-close" aria-label="关闭">×</button></div>
+      <div class="size-options" role="group" aria-label="选择空间边长">
+        <button type="button" data-size="3">3</button>
+        <button type="button" class="active" data-size="4">4</button>
+        <button type="button" data-size="5">5</button>
+        <button type="button" data-size="6">6</button>
+        <button type="button" data-size="7">7</button>
+        <button type="button" data-size="8">8</button>
+      </div>
+      <p>选择后立即应用，三个方向均使用相同边长。</p>
+    </div>
+    <section class="section-panel" id="section-panel" aria-labelledby="section-title" hidden>
+      <div class="section-panel-head">
+        <div><b id="section-title">剖切平面</b><span id="section-direction">保留箭头一侧</span></div>
+        <button type="button" id="section-close" aria-label="关闭剖切" title="关闭剖切">×</button>
+      </div>
+      <div class="section-presets" role="group" aria-label="剖切方向预设">
+        <button type="button" data-section-preset="x" aria-pressed="true">X</button>
+        <button type="button" data-section-preset="y" aria-pressed="false">Y</button>
+        <button type="button" data-section-preset="z" aria-pressed="false">Z</button>
+        <button type="button" data-section-preset="diagonal" aria-pressed="false">45°</button>
+      </div>
+      <label class="section-control" for="section-position">
+        <span>位置 <output id="section-position-value">0%</output></span>
+        <input id="section-position" type="range" min="-100" max="100" step="1" value="0">
+      </label>
+      <label class="section-control" for="section-azimuth">
+        <span>水平角 <output id="section-azimuth-value">0°</output></span>
+        <input id="section-azimuth" type="range" min="-180" max="180" step="1" value="0">
+      </label>
+      <label class="section-control" for="section-elevation">
+        <span>倾斜角 <output id="section-elevation-value">0°</output></span>
+        <input id="section-elevation" type="range" min="-90" max="90" step="1" value="0">
+      </label>
+      <div class="section-panel-actions">
+        <button type="button" id="section-flip" aria-pressed="false">反向保留</button>
+        <button type="button" id="section-reset">复位</button>
+      </div>
+    </section>
+    <div id="three-container"></div>
+
+    <!-- 视角控制（学习/搭建用） -->
+    <div class="view-btns" id="view-btns">
+      <button class="vb" data-view="front" aria-pressed="false">前</button>
+      <button class="vb" data-view="left" aria-pressed="false">左</button>
+      <button class="vb" data-view="top" aria-pressed="false">上</button>
+      <button class="vb active" data-view="iso" aria-pressed="true">立体</button>
+    </div>
+
+    <!-- 模式工具栏 -->
+    <div class="stage-toolbar" id="stage-toolbar"></div>
+
+  </section>
+
+  <!-- 三视图面板 -->
+  <aside class="views-panel">
+    <div class="panel-heading">
+      <div><strong>三视图</strong><small>方向与立体模型保持一致</small></div>
+    </div>
+    <div class="view-card" id="card-front">
+      <div class="view-title"><div><b>正视图</b><small>站在前面，向后看</small></div></div>
+      <div class="projection-wrap projection-front">
+        <span class="axis axis-up">上</span><span class="axis axis-down">下</span>
+        <span class="axis axis-left">左</span><span class="axis axis-right">右</span>
+        <div class="view-grid" id="grid-front"></div>
+      </div>
+      <div class="view-info" id="info-front"></div>
+    </div>
+    <div class="view-card" id="card-left">
+      <div class="view-title"><div><b>左视图</b><small>站在左面，向右看</small></div></div>
+      <div class="projection-wrap projection-left">
+        <span class="axis axis-up">上</span><span class="axis axis-down">下</span>
+        <span class="axis axis-left">后</span><span class="axis axis-right">前</span>
+        <div class="view-grid" id="grid-left"></div>
+      </div>
+      <div class="view-info" id="info-left"></div>
+    </div>
+    <div class="view-card" id="card-top">
+      <div class="view-title"><div><b>俯视图</b><small>站在上面，向下看</small></div></div>
+      <div class="projection-wrap projection-top">
+        <span class="axis axis-up">后</span><span class="axis axis-down">前</span>
+        <span class="axis axis-left">左</span><span class="axis axis-right">右</span>
+        <div class="view-grid" id="grid-top"></div>
+      </div>
+      <div class="view-info" id="info-top"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="overlay"></div>
+<div id="confetti-canvas-wrap"><canvas id="confetti-canvas"></canvas></div>
+
+<script src="js/three.min.js?v=20260805.5"></script>
+<script src="js/OrbitControls.js?v=20260805.5"></script>
+<script src="js/coordinates.js?v=20260805.5"></script>
+<script src="js/section-geometry.js?v=20260901.1"></script>
+<script src="js/voice-library.js?v=20260805.5"></script>
+<script src="js/app.js?v=20260901.1"></script>
+</body>
+</html>

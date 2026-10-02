@@ -1,0 +1,26 @@
+{
+  "name": "sanview",
+  "version": "1.0.0",
+  "private": true,
+  "description": "面向儿童的积木三视图互动实验室",
+  "scripts": {
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node tests/coordinates.test.js && node tests/section-geometry.test.js && node tests/voice-library.test.js",
+    "test:e2e": "node tests/e2e.test.js",
+    "check": "node --check js/coordinates.js && node --check js/section-geometry.js && node --check js/voice-library.js && node --check js/app.js && node --check scripts/generate-voices.js && npm run test:unit",
+    "voice:generate": "node scripts/generate-voices.js"
+  },
+  "keywords": [
+    "three-view",
+    "spatial-reasoning",
+    "education",
+    "threejs"
+  ],
+  "devDependencies": {
+    "playwright": "1.60.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
