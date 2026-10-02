@@ -29,6 +29,10 @@ var cubes = new Map();
 var practiceMode = 'draw';
 var practiceAnswer = null;
 var practiceDrawn = null;
+var drawingBeforeClear = null;
+var practiceAssist = false;
+var questionCompleted = false;
+var introStep = 0;
 var challengeAnswer = null;
 var challengeMatch = { front: false, left: false, top: false };
 var difficulty = 0;
@@ -113,6 +117,7 @@ function initThree() {
   controls.enablePan = false;
   controls.maxPolarAngle = Math.PI * 0.85;
   controls.addEventListener('start', function () {
+    document.querySelectorAll('.view-card').forEach(function (card) { card.classList.remove('is-directed'); });
     document.querySelectorAll('.vb').forEach(function (button) {
       button.classList.toggle('active', button.dataset.view === 'iso');
       button.setAttribute('aria-pressed', String(button.dataset.view === 'iso'));
@@ -523,6 +528,7 @@ function setSizeEditorOpen(open) {
 
 function applyDimensions(size) {
   size = clampDimension(size);
+  if (size !== GRID_W && !confirmPracticeReplacement('更换方格边长会生成新题')) return;
   document.querySelectorAll('.size-options button').forEach(function (button) {
     var active = parseInt(button.dataset.size, 10) === size;
     button.classList.toggle('active', active);
@@ -550,7 +556,7 @@ function applyDimensions(size) {
     });
     afterBuildAction();
     flyTo('iso');
-    if (size < previousSize) setWorkspaceStatus('空间已缩小，超出边界的积木已收起。点击撤销可恢复完整作品。');
+    if (size < previousSize) setWorkspaceStatus('空间已缩小，移除了 ' + (previous.length - cubes.size) + ' 块超出边界的积木。点击“撤销”可恢复原尺寸和完整作品。');
   }
 }
 
@@ -700,6 +706,7 @@ function makeGrid(el, cols, rows) {
 function makeInteractiveGrid(el, viewName, cols, rows) {
   el.innerHTML = '';
   el.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+  el.style.setProperty('--grid-cols', cols);
   for (var i = 0; i < cols * rows; i++) {
     var row = Math.floor(i / cols) + 1;
     var col = (i % cols) + 1;
@@ -760,6 +767,9 @@ function renderInteractive(id, viewName, cols, rows) {
   var cells = makeInteractiveGrid(document.getElementById(id), names[viewName], cols, rows);
   for (var i = 0; i < cells.length; i++) {
     cells[i].addEventListener('click', function () {
+      drawingBeforeClear = null;
+      updateDrawingUndo();
+      setWorkspaceStatus('');
       this.classList.remove('miss', 'wrong');
       this.removeAttribute('aria-invalid');
       this.removeAttribute('aria-description');
@@ -771,8 +781,8 @@ function renderInteractive(id, viewName, cols, rows) {
       this.setAttribute('aria-label', this.getAttribute('aria-label').replace(/，(未涂色|已涂色)$/, this.classList.contains('filled') ? '，已涂色' : '，未涂色'));
       if (practiceDrawn) {
         updateDrawnFromDOM();
-        updateStatusSummary();
         document.getElementById('card-' + viewName).classList.remove('win', 'fail');
+        updateStatusSummary();
         document.getElementById('info-' + viewName).textContent = '已修改，点击检查确认';
       }
     });
@@ -828,6 +838,10 @@ function flyTo(viewName) {
     b.setAttribute('aria-pressed', String(active));
   });
   var cardMap = { front: 'card-front', left: 'card-left', top: 'card-top' };
+  document.querySelectorAll('.view-card').forEach(function (item) {
+    item.classList.toggle('is-directed', item.id === cardMap[viewName]);
+  });
+  if (viewName !== 'iso') selectProjection(viewName);
   var card = cardMap[viewName] ? document.getElementById(cardMap[viewName]) : null;
   if (card) { card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash'); }
   if (camAnim) cancelAnimationFrame(camAnim);
@@ -871,9 +885,6 @@ function setupPicking() {
     if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 2) return;
     pointers.add(e.pointerId);
     if (pointers.size > 1) multiTouch = true;
-    if (e.pointerType === 'mouse' && isBuildLikeMode() && (e.button === 0 || e.button === 2)) {
-      selectBuildTool(e.button === 2 ? 'remove' : 'add', false);
-    }
     pDown = { x: e.clientX, y: e.clientY, button: e.button, id: e.pointerId };
     pTime = Date.now();
   });
@@ -953,10 +964,10 @@ function getBuildHit(e) {
   return cubeHit || baseHit;
 }
 
-function getBuildTarget(e) {
+function getBuildTarget(e, tool) {
   var hit = getBuildHit(e);
   if (!hit) return null;
-  if (buildTool === 'remove') {
+  if ((tool || buildTool) === 'remove') {
     return hit.kind === 'cube' ? { x: hit.x, y: hit.y, z: hit.z } : null;
   }
   var target = hit.kind === 'cube' ? Coordinates.adjacent(hit, hit.normal) : hit;
@@ -965,10 +976,11 @@ function getBuildTarget(e) {
 
 function handleTap(e) {
   if (!isBuildLikeMode()) return;
-  var target = getBuildTarget(e);
+  var tool = e.pointerType === 'mouse' && e.button === 2 ? 'remove' : buildTool;
+  var target = getBuildTarget(e, tool);
   if (!target) return;
   var key = target.x + ',' + target.y + ',' + target.z;
-  if (buildTool === 'add') {
+  if (tool === 'add') {
     if (cubes.has(key)) return;
     if (target.y > 0 && !cubes.has(target.x + ',' + (target.y - 1) + ',' + target.z)) {
       setWorkspaceStatus('这块积木需要支撑，请先搭好下面一层。');
@@ -982,10 +994,10 @@ function handleTap(e) {
     }
   }
   rememberBuild();
-  if (buildTool === 'add') addCube(target.x, target.y, target.z);
+  if (tool === 'add') addCube(target.x, target.y, target.z);
   else removeCube(target.x, target.y, target.z);
   afterBuildAction();
-  playSound(buildTool === 'add' ? 'place' : 'pop');
+  playSound(tool === 'add' ? 'place' : 'pop');
 }
 
 function snapshotBuild() {
@@ -1042,6 +1054,7 @@ function applyBuildAt(x, z) {
 }
 
 function afterBuildAction() {
+  setWorkspaceStatus('');
   if (MODE === 'practice' && practiceMode === 'challenge') {
     renderViews('challenge');
     updateChallengeProgress(false);
@@ -1056,6 +1069,7 @@ function afterBuildAction() {
 /* ---------- 本地作品与学习记录 ---------- */
 function setWorkspaceStatus(message) {
   document.getElementById('workspace-status').textContent = message;
+  document.getElementById('projection-status').textContent = message;
 }
 
 function saveCurrentBuild(announce) {
@@ -1070,10 +1084,17 @@ function saveCurrentBuild(announce) {
 function startQuestion() {
   questionId = sessionId + '-' + (++questionSequence);
   questionAssisted = false;
+  questionCompleted = false;
+  drawingBeforeClear = null;
+  practiceAssist = false;
+  updatePracticeAssist();
+  updateDrawingUndo();
+  selectProjection('front');
   setWorkspaceStatus('');
 }
 
 function recordPractice(solved) {
+  if (solved) questionCompleted = true;
   progress = Learning.recordResult(progress, { questionId: questionId, mode: practiceMode, solved: solved, assisted: questionAssisted });
   if (!storage.saveProgress(progress)) setWorkspaceStatus('浏览器无法保存练习记录，本次仍可正常练习。');
   updateScore();
@@ -1082,20 +1103,88 @@ function recordPractice(solved) {
 function updateMission() {
   var task = MODE === 'practice' ? practiceMode : MODE;
   var missions = {
-    learn: ['从不同方向，观察同一个模型', '选择范例或随机生成模型，切换视角、调整空间，也可以用当前模型开始练习。'],
-    draw: ['观察模型，画出三幅投影', '填写各方向能看到的格子。＋表示漏填，×表示多填；颜色不影响判题。'],
+    learn: ['从不同方向，观察同一个模型', '先点“从前看”，把立体模型与正视图对照。重叠的积木只占同一格。'],
+    draw: ['观察模型，画出三幅投影', '点格子涂色，再点取消。画完三幅后检查；＋表示漏填，×表示多填。'],
     challenge: ['根据三视图，还原一种空间结构', '先确定占地，再调整高度。三幅投影一致即可通过，允许不同的正确搭法。'],
     build: ['自由搭建，实时对照三视图', '增减积木、切换方向或剖切探索。作品自动保存在此浏览器，支持撤销与导出。']
   };
   document.getElementById('mission-title').textContent = missions[task][0];
   document.getElementById('mission-description').textContent = missions[task][1];
   var prompts = {
-    learn: '先问：“如果站到模型前面，你觉得会看到几格？”听孩子说理由，再点击“前”一起验证。',
+    learn: '先问：“如果站到模型前面，你觉得会看到几格？”听孩子说理由，再点击“从前看”一起验证。',
     draw: '先让孩子说一行或一列应该画几格，再自己点格子。遇到错误，问“这一格从哪个方向能看到？”不要急着看答案。',
     challenge: '先问：“从上面看，有哪些位置放了积木？”从底层开始搭，再用正视图和左视图调整高度。',
     build: '请孩子先搭一个小模型。只增减一块，再问“哪一幅图变了？哪一幅没变？为什么？”'
   };
   document.getElementById('parent-prompt').textContent = prompts[task];
+}
+
+// Keep the first-use explanation on the current model, so each direction can
+// be compared without replacing the user's subject or opening a blocking tour.
+function showIntroStep() {
+  var directions = ['front', 'left', 'top'];
+  var view = directions[introStep];
+  var count = countView(computeViews()[view]);
+  var steps = [
+    ['从前面看，就是正视图', '沿模型前方直着看，前后重叠的积木只占同一格。这个方向能看到 ' + count + ' 格，对照正视图找一找。'],
+    ['从左面看，就是左视图', '换到模型左侧，左右重叠的积木只占同一格。图中左边是“后”、右边是“前”，这个方向有 ' + count + ' 格。'],
+    ['从上面看，就是俯视图', '看看哪些位置放了积木；同一列堆得再高也只占一格。这里占地 ' + count + ' 格。颜色区分高度，画图只需判断形状。']
+  ];
+  document.getElementById('intro-step').textContent = '看懂三视图 · ' + (introStep + 1) + ' / 3';
+  document.getElementById('intro-title').textContent = steps[introStep][0];
+  document.getElementById('intro-description').textContent = steps[introStep][1];
+  document.getElementById('intro-prev').disabled = introStep === 0;
+  document.getElementById('intro-next').textContent = introStep === 2 ? '完成，继续探索' : '下一方向';
+  flyTo(view);
+}
+
+function openIntro() {
+  if (MODE !== 'learn') return;
+  introStep = 0;
+  setSectionEnabled(false);
+  document.getElementById('intro-guide').hidden = false;
+  document.getElementById('intro-start').setAttribute('aria-expanded', 'true');
+  showIntroStep();
+  document.getElementById('intro-guide').scrollIntoView({ block: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
+  document.getElementById('intro-next').focus({ preventScroll: true });
+}
+
+function closeIntro(restoreFocus) {
+  document.getElementById('intro-guide').hidden = true;
+  document.getElementById('intro-start').setAttribute('aria-expanded', 'false');
+  if (restoreFocus) {
+    flyTo('iso');
+    document.getElementById('intro-start').focus({ preventScroll: true });
+  }
+}
+
+function confirmPracticeReplacement(action) {
+  if (MODE !== 'practice' || questionCompleted) return true;
+  var hasWork = practiceMode === 'challenge' ? cubes.size > 0 : practiceDrawn &&
+    ['front', 'left', 'top'].some(function (view) { return practiceDrawn[view].some(Boolean); });
+  return !hasWork || window.confirm(action + '，当前作答还未完成，将被清除。继续吗？');
+}
+
+function updatePracticeAssist() {
+  var button = document.getElementById('practice-assist');
+  if (button) {
+    button.setAttribute('aria-pressed', String(practiceAssist));
+    button.textContent = practiceAssist ? '关闭方向辅助' : '辅助观察';
+  }
+  document.getElementById('view-btns').style.display = MODE === 'practice' && practiceMode === 'draw' && !practiceAssist ? 'none' : '';
+}
+
+function togglePracticeAssist() {
+  practiceAssist = !practiceAssist;
+  if (practiceAssist) {
+    questionAssisted = true;
+    recordPractice(false);
+    setWorkspaceStatus('方向辅助已开启：点“从前看 / 从左看 / 从上看”对齐观察。本题记为参考学习。');
+  } else {
+    flyTo('iso');
+    setWorkspaceStatus('方向辅助已关闭，可以继续作答。本题仍记为参考学习；新题可独立完成。');
+  }
+  updatePracticeAssist();
 }
 
 function selectProjection(view) {
@@ -1139,6 +1228,7 @@ function importBuildFile(event) {
     try {
       var model = Learning.parseBuild(String(reader.result));
       if (MODE !== 'build') setMode('build');
+      if (MODE !== 'build') return;
       rememberBuild();
       restoreBuild(model);
       flyTo('iso');
@@ -1211,7 +1301,8 @@ function browserSpeak(text) {
 
 function speakKey(key, fallbackText) {
   if (!soundOn) return;
-  var variants = voiceLibrary[key] || [];
+  // Keep prerecorded feedback that also makes sense in the mobile layout.
+  var variants = (voiceLibrary[key] || []).filter(function (entry) { return !/右边|左边|循环切换/.test(entry.text); });
   if (!variants.length || typeof Audio === 'undefined') {
     browserSpeak(fallbackText || key);
     return;
@@ -1245,6 +1336,7 @@ function randomSupportedStructure(level) {
 }
 
 function loadRandomObservation(announce) {
+  closeIntro(false);
   var exampleSelect = document.getElementById('learn-example');
   if (exampleSelect) exampleSelect.value = '';
   updateMission();
@@ -1259,6 +1351,7 @@ function loadRandomObservation(announce) {
 }
 
 function loadExample(id) {
+  closeIntro(false);
   if (!id) { loadRandomObservation(); return; }
   var model = ModelLibrary.create(id, GRID_W);
   clearCubes();
@@ -1315,7 +1408,7 @@ function newPractice(announce, structure) {
   practiceAnswer = viewMask(computeViews());
   practiceDrawn = { front: [], left: [], top: [] };
   renderViews('practice');
-  setInfo(['请填出正视投影', '请填出左视投影', '请填出俯视投影']);
+  setInfo(['点格子涂色，再点取消', '点格子涂色，再点取消', '点格子涂色，再点取消']);
   updateStatusSummary();
   flyTo('iso');
   if (announce === true) speakKey('draw_new');
@@ -1361,6 +1454,7 @@ function checkPractice() {
     feedback.push(matched ? '<b>这一幅画对了</b>' : '漏填 ' + missing + ' 格 · 多填 ' + extra + ' 格');
   });
   setInfo(feedback);
+  setWorkspaceStatus(allCorrect ? '三幅投影都画对了。' : '先修改' + { front: '正视图', left: '左视图', top: '俯视图' }[firstFail] + '：＋需要补上，×需要取消，再检查三幅。');
   recordPractice(allCorrect);
   if (allCorrect) {
     playSound('win');
@@ -1384,48 +1478,70 @@ function checkPractice() {
 
 function showAnswer() {
   if (!practiceAnswer) return;
+  prepareDialog();
   questionAssisted = true;
   recordPractice(false);
-  var map = { front: 'grid-front', left: 'grid-left', top: 'grid-top' };
-  Object.keys(map).forEach(function (k) {
-    var cells = document.getElementById(map[k]).children;
-    practiceAnswer[k].forEach(function (v, i) {
-      cells[i].classList.remove('miss', 'wrong');
-      cells[i].style.outline = '';
-      cells[i].style.borderColor = '';
-      cells[i].removeAttribute('aria-invalid');
-      cells[i].removeAttribute('aria-description');
-      if (v) { cells[i].classList.add('filled'); cells[i].style.background = '#51CF66'; }
-      else { cells[i].classList.remove('filled'); cells[i].style.background = ''; }
-      cells[i].setAttribute('aria-pressed', String(v));
-      cells[i].setAttribute('aria-label', cells[i].getAttribute('aria-label').replace(/，(未涂色|已涂色)$/, v ? '，已涂色' : '，未涂色'));
-    });
-  });
-  updateDrawnFromDOM();
-  updateStatusSummary();
-  setWorkspaceStatus('已显示答案。本题记为参考学习，不计入独立完成；可以换一道新题试试。');
+  var names = { front: '正视图', left: '左视图', top: '俯视图' };
+  var overlay = document.getElementById('overlay');
+  overlay.innerHTML = '<section class="win-box answer-box" role="dialog" aria-modal="true" aria-labelledby="answer-title" aria-describedby="answer-note">' +
+    '<div class="answer-header"><h2 id="answer-title">参考答案</h2><button class="again" id="answer-close">返回作答</button></div><p class="answer-note" id="answer-note">原来的作答已保留。关闭后可以继续修改；本题记为参考学习，不计入独立完成。</p>' +
+    '<div class="answer-layout">' + Object.keys(names).map(function (view) {
+      return '<section class="answer-view" data-view="' + view + '"><h3>' + names[view] + '</h3>' +
+        '<div class="answer-grid" role="img" aria-label="' + names[view] + '参考形状" style="grid-template-columns:repeat(' + GRID_W + ',1fr)">' +
+        practiceAnswer[view].map(function (filled) { return '<span class="answer-cell' + (filled ? ' filled' : '') + '" aria-hidden="true"></span>'; }).join('') +
+        '</div><p class="answer-coordinates">涂色位置：' + practiceAnswer[view].map(function (value, index) { return value ? (Math.floor(index / GRID_W) + 1) + '行' + (index % GRID_W + 1) + '列' : ''; }).filter(Boolean).join('、') + '</p></section>';
+    }).join('') + '</div></section>';
+  overlay.classList.add('show', 'answer-overlay');
+  document.getElementById('answer-close').addEventListener('click', hideWinOverlay);
+  overlay.onclick = function (event) { if (event.target === overlay) hideWinOverlay(); };
+  document.getElementById('answer-close').focus();
+  setWorkspaceStatus('参考答案已打开，原作答保留。本题记为参考学习。');
   speakKey('answer_reveal');
 }
 
 function clearDrawing() {
+  updateDrawnFromDOM();
+  if (!['front', 'left', 'top'].some(function (view) { return practiceDrawn[view].some(Boolean); })) return;
+  drawingBeforeClear = practiceDrawn;
+  restoreDrawing({ front: [], left: [], top: [] });
+  updateDrawingUndo();
+  setWorkspaceStatus('已清空三幅作答。点“撤销清空”可以恢复。');
+  speakKey('drawing_reset');
+}
+
+function restoreDrawing(drawing) {
   clearViewFeedback();
-  setInfo(['请填出正视投影', '请填出左视投影', '请填出俯视投影']);
-  ['grid-front', 'grid-left', 'grid-top'].forEach(function (id) {
-    var cells = document.getElementById(id).children;
+  setInfo(['点格子涂色，再点取消', '点格子涂色，再点取消', '点格子涂色，再点取消']);
+  ['front', 'left', 'top'].forEach(function (view) {
+    var cells = document.getElementById('grid-' + view).children;
     for (var i = 0; i < cells.length; i++) {
-      cells[i].classList.remove('filled', 'miss', 'wrong');
-      cells[i].style.background = '';
+      var filled = Boolean(drawing[view][i]);
+      cells[i].classList.remove('miss', 'wrong');
+      cells[i].classList.toggle('filled', filled);
+      cells[i].style.background = filled ? '#FF9F43' : '';
       cells[i].style.outline = '';
       cells[i].style.borderColor = '';
       cells[i].removeAttribute('aria-invalid');
       cells[i].removeAttribute('aria-description');
-      cells[i].setAttribute('aria-pressed', 'false');
-      cells[i].setAttribute('aria-label', cells[i].getAttribute('aria-label').replace(/，(未涂色|已涂色)$/, '，未涂色'));
+      cells[i].setAttribute('aria-pressed', String(filled));
+      cells[i].setAttribute('aria-label', cells[i].getAttribute('aria-label').replace(/，(未涂色|已涂色)$/, filled ? '，已涂色' : '，未涂色'));
     }
   });
-  practiceDrawn = { front: [], left: [], top: [] };
+  updateDrawnFromDOM();
   updateStatusSummary();
-  speakKey('drawing_reset');
+}
+
+function updateDrawingUndo() {
+  var button = document.getElementById('practice-undo-clear');
+  if (button) button.disabled = !drawingBeforeClear;
+}
+
+function undoClearDrawing() {
+  if (!drawingBeforeClear) return;
+  restoreDrawing(drawingBeforeClear);
+  drawingBeforeClear = null;
+  updateDrawingUndo();
+  setWorkspaceStatus('已恢复清空前的三幅作答。');
 }
 
 function sameMask(left, right) {
@@ -1473,6 +1589,9 @@ function updateChallengeProgress(showErrors) {
 
 function checkChallenge() {
   var solved = updateChallengeProgress(true);
+  var firstFail = ['front', 'left', 'top'].find(function (view) { return !challengeMatch[view]; });
+  setWorkspaceStatus(solved ? '三幅投影都匹配，模型还原成功。' : { front: '正视图', left: '左视图', top: '俯视图' }[firstFail] + '还不一致，先对照这一幅调整积木。搭法可以不同，三幅投影都一致即可。');
+  if (firstFail) selectProjection(firstFail);
   recordPractice(solved);
   if (solved) {
     playSound('win');
@@ -1490,7 +1609,7 @@ function updateScore() {
   var el = document.getElementById('score-text');
   if (el) el.textContent = '独立 ' + summary.independent + '/' + summary.attempted;
   document.getElementById('progress-summary').textContent = '本机记录 · 练过 ' + summary.attempted + ' 题 · 独立完成 ' + summary.independent + ' 题';
-  document.getElementById('progress-summary').title = '保留最近 ' + Learning.MAX_PROGRESS_RECORDS + ' 题；参考答案后完成 ' + (summary.solved - summary.independent) + ' 题。用于回顾学习，不是考试成绩。';
+  document.getElementById('progress-summary').title = '保留最近 ' + Learning.MAX_PROGRESS_RECORDS + ' 题；参考学习完成 ' + (summary.solved - summary.independent) + ' 题。用于回顾学习，不是考试成绩。';
 }
 
 /* ============================================================
@@ -1521,7 +1640,8 @@ function showWinOverlay(kind) {
 
 function hideWinOverlay() {
   var overlay = document.getElementById('overlay');
-  overlay.classList.remove('show', 'tutorial-overlay');
+  if (overlay.classList.contains('answer-overlay')) setWorkspaceStatus('已返回你的作答，可继续修改。本题记为参考学习。');
+  overlay.classList.remove('show', 'tutorial-overlay', 'answer-overlay');
   overlay.innerHTML = '';
   overlay.onclick = null;
   document.body.appendChild(overlay);
@@ -1534,30 +1654,31 @@ function prepareDialog() {
   if (!overlay.classList.contains('show')) previousDialogFocus = document.activeElement;
   // Dialogs must belong to the fullscreen subtree to remain visible.
   if (document.fullscreenElement) document.fullscreenElement.appendChild(overlay);
+  else if (document.getElementById('workspace').classList.contains('is-expanded')) document.getElementById('workspace').appendChild(overlay);
 }
 
 var tutorialStep = 0;
 var activeTutorialKey = 'learn';
 var TUTORIALS = {
   learn: [
-    { target: '#stage-toolbar', title: '选择合适的观察难度', text: '点击左右箭头循环切换简单、中等、困难和挑战；换一组会生成新的立体结构。' },
-    { target: '#view-btns', title: '从三个方向观察', text: '依次切到前、左、上，看看立体结构在每个方向留下什么形状。' },
-    { target: '.views-panel', title: '对照三视图', text: '正视图、左视图和俯视图会随结构同步变化，先看轮廓，再比较各行各列。' }
+    { target: '#intro-start', title: '先看懂一个方向', text: '点“第一次用？看懂三视图”，会用当前模型逐个演示三个方向。沿一个方向直着看，重叠的积木只占同一格。' },
+    { target: '#view-btns', title: '对齐方向，比较形状', text: '点“从前看、从左看、从上看”，分别对照正视图、左视图和俯视图。手机可切换投影，也可以随时回看模型。' },
+    { target: '#stage-toolbar', title: '选择模型，自由探索', text: '先从范例或简单难度开始。难度箭头在简单到挑战之间逐级调整；“随机换模型”会换一个结构，也可以用当前模型练习。' }
   ],
   draw: [
-    { target: '#practice-switcher-slot', title: '当前任务是画视图', text: '给定左侧立体结构，在右侧三张网格中画出它的正视图、左视图和俯视图。' },
-    { target: '.views-panel', title: '点击格子作答', text: '点击格子进行涂色；三个视图都完成后点击检查，红色格子表示需要修改。' },
-    { target: '#stage-toolbar', title: '控制题目与反馈', text: '可切换难度、换新题、查看答案或重画。答案适合卡住时学习，不计作独立完成。' }
+    { target: '#practice-switcher-slot', title: '观察模型，画三个方向', text: '先旋转立体模型，再画出三个方向能看到的形状。需要按方向对齐时可以开启“辅助观察”，本题会记为参考学习。' },
+    { target: '.views-panel', title: '点格子涂色，再点取消', text: '手机切换正视图、左视图和俯视图逐幅作答；画完后点“检查三幅”。＋表示漏填，×表示多填，颜色不影响判题。' },
+    { target: '#projection-actions', title: '保留作答，放心比较', text: '“查看参考答案”单独展示答案，关闭后继续修改原作答。清空三幅后可以撤销；开启辅助或查看答案的题目不计入独立完成。' }
   ],
   challenge: [
-    { target: '#practice-switcher-slot', title: '当前任务是还原积木', text: '右侧给出目标三视图，你需要在左侧搭出一个投影完全一致的结构。' },
-    { target: '#build-pad', title: '使用俯视搭建盘', text: '每个格子代表一列积木。电脑左键增加、右键减少；手机先选择增加或减少。' },
+    { target: '#practice-switcher-slot', title: '根据投影，还原一种结构', text: '先看三个方向的目标形状，在搭建盘上搭积木。可以先按俯视图确定哪些位置要放，再调整每列高度。' },
+    { target: '#build-pad', title: '使用俯视搭建盘', text: '数字表示这一列的高度。先选“增加”或“减少”，再单击或轻触格子；鼠标右键可临时减少。积木从底层搭起、从顶层拆下。' },
     { target: '.views-panel', title: '观察匹配进度', text: '每次搭建后系统都会比较三幅投影。三个视图全部匹配即可通过，不要求坐标与原题唯一解完全相同。' }
   ],
   build: [
-    { target: '#three-container', title: '自由搭建立体结构', text: '直接点击底座或方块表面增加积木，拖动空白处可以旋转观察。' },
-    { target: '#build-pad', title: '精确调整每一列', text: '俯视搭建盘中的数字表示该列高度，电脑右键可减少最上方一块。' },
-    { target: '#stage-toolbar', title: '撤销和清空', text: '撤销可恢复上一步，清空后也能立即撤销；手机端保留增加和减少两个操作按钮。' }
+    { target: '#three-container', title: '选择工具，再动手搭建', text: '先选“增加”或“减少”，再单击或轻触模型；拖动可以旋转。新增积木下方要有支撑，移除时从最上方开始。' },
+    { target: '#build-pad', title: '精确调整每一列', text: '搭建盘中的数字表示该列高度。电脑和手机都按当前工具增减，鼠标右键可临时减少最上方一块，不会切换工具。' },
+    { target: '#stage-toolbar', title: '作品自动保存，可以撤销', text: '撤销可恢复增减、清空、改尺寸或导入前的作品。作品自动保存在此浏览器；导出文件可以备份，或在其他设备导入继续。' }
   ]
 };
 
@@ -1609,7 +1730,9 @@ function renderTutorialStep() {
     else { tutorialStep++; renderTutorialStep(); }
   });
   document.getElementById('tutorial-next').focus();
-  speakKey('tutorial_' + activeTutorialKey + '_' + (tutorialStep + 1), step.title + '。' + step.text);
+  // Read the current instructions rather than playing outdated recorded copy.
+  stopVoice();
+  browserSpeak(step.title + '。' + step.text);
 }
 
 function openTutorial() {
@@ -1699,17 +1822,19 @@ function bindPracticeSwitcher() {
     button.classList.toggle('active', active);
     button.addEventListener('click', function () {
       if (this.dataset.practiceMode === practiceMode) return;
+      if (!confirmPracticeReplacement('切换练习类型会生成新题')) return;
       practiceMode = this.dataset.practiceMode;
       setupPracticeMode();
+      document.querySelector('button[data-practice-mode="' + practiceMode + '"]').focus({ preventScroll: true });
     });
   });
 }
 
 function buildToolsMarkup(includeChallengeActions) {
   var actions = includeChallengeActions ?
-    '<button class="tbtn teal" id="challenge-new">新题</button><button class="tbtn primary" id="challenge-check">检查</button>' : '';
+    '<button class="tbtn teal" id="challenge-new">换一道新题</button>' : '';
   return actions +
-    '<span class="build-input-hint desktop-input-hint">左键增加 · 右键减少</span>' +
+    '<span class="build-input-hint desktop-input-hint">先选工具，再单击 · 右键临时减少</span>' +
     '<span class="build-input-hint mobile-input-hint">选择工具后轻点</span>' +
     '<div class="tool-segment mobile-build-tools" role="group" aria-label="搭建工具">' +
     '<button class="tbtn add on" id="tool-add"><span aria-hidden="true">＋</span> 增加</button>' +
@@ -1820,11 +1945,10 @@ function bindBuildCell(button) {
     if (!press || press.button !== event.button) return;
     var dx = event.clientX - press.x, dy = event.clientY - press.y;
     var duration = Date.now() - press.time;
-    var tool = press.pointerType === 'mouse' ? (event.button === 2 ? 'remove' : 'add') : buildTool;
+    var tool = press.pointerType === 'mouse' && event.button === 2 ? 'remove' : buildTool;
     press = null;
     if (Math.abs(dx) >= 10 || Math.abs(dy) >= 10 || duration >= 1200) return;
     event.preventDefault();
-    selectBuildTool(tool, false);
     applyBuildAt(parseInt(this.dataset.x, 10), parseInt(this.dataset.z, 10), tool);
   });
   button.addEventListener('click', function (event) {
@@ -1870,6 +1994,8 @@ function setupPracticeMode() {
   var switcherSlot = document.getElementById('practice-switcher-slot');
   var viewBtns = document.getElementById('view-btns');
   var buildPad = document.getElementById('build-pad');
+  var actions = document.getElementById('projection-actions');
+  actions.hidden = false;
   switcherSlot.hidden = false;
   switcherSlot.innerHTML = practiceSwitcherMarkup();
   bindPracticeSwitcher();
@@ -1878,32 +2004,40 @@ function setupPracticeMode() {
   if (practiceMode === 'draw') {
     if (buildPad) buildPad.hidden = true;
     toolbar.innerHTML = difficultyControlMarkup('practice-difficulty', difficulty, '画视图难度') +
-      '<button class="tbtn teal" id="practice-new">新题</button>' +
-      '<button class="tbtn primary" id="practice-check">检查</button>' +
-      '<button class="tbtn tool" id="practice-answer">答案</button>' +
-      '<button class="tbtn ghost" id="practice-clear">重画</button>' +
-      '<span class="stars" id="score-text"></span>';
+      '<button class="tbtn teal" id="practice-new">换一道新题</button>' +
+      '<button class="tbtn tool" id="practice-assist" aria-pressed="false" aria-describedby="practice-assist-note">辅助观察</button>' +
+      '<small id="practice-assist-note" class="practice-note">开启方向辅助后，本题记为参考学习。</small>';
+    actions.innerHTML = '<button class="tbtn primary" id="practice-check">检查三幅</button>' +
+      '<button class="tbtn tool" id="practice-answer" aria-describedby="practice-answer-note">查看参考答案</button>' +
+      '<button class="tbtn ghost" id="practice-clear">清空三幅</button>' +
+      '<button class="tbtn ghost" id="practice-undo-clear" disabled>撤销清空</button>' +
+      '<small id="practice-answer-note" class="practice-note">查看答案会记为参考学习，原作答保留。</small><span class="stars" id="score-text"></span>';
     updateScore();
     bindDifficultyControl('practice-difficulty', function () { return difficulty; }, function (value) {
+      if (!confirmPracticeReplacement('调整难度会生成新题')) return;
       difficulty = value;
       newPractice();
     });
-    document.getElementById('practice-new').addEventListener('click', function () { newPractice(true); });
+    document.getElementById('practice-new').addEventListener('click', function () { if (confirmPracticeReplacement('换一道新题')) newPractice(true); });
+    document.getElementById('practice-assist').addEventListener('click', togglePracticeAssist);
     document.getElementById('practice-check').addEventListener('click', checkPractice);
     document.getElementById('practice-answer').addEventListener('click', showAnswer);
     document.getElementById('practice-clear').addEventListener('click', clearDrawing);
+    document.getElementById('practice-undo-clear').addEventListener('click', undoClearDrawing);
     viewBtns.style.display = 'none';
     newPractice();
     return;
   }
 
   toolbar.innerHTML = difficultyControlMarkup('challenge-difficulty', difficulty, '还原积木难度') + buildToolsMarkup(true);
+  actions.innerHTML = '<button class="tbtn primary" id="challenge-check">检查三幅</button><small class="practice-note">三幅投影都匹配即可，不要求只有一种搭法。</small>';
   bindDifficultyControl('challenge-difficulty', function () { return difficulty; }, function (value) {
+    if (!confirmPracticeReplacement('调整难度会生成新题')) return;
     difficulty = value;
     newChallenge();
   });
   bindBuildToolbar();
-  document.getElementById('challenge-new').addEventListener('click', function () { newChallenge(true); });
+  document.getElementById('challenge-new').addEventListener('click', function () { if (confirmPracticeReplacement('换一道新题')) newChallenge(true); });
   document.getElementById('challenge-check').addEventListener('click', checkChallenge);
   viewBtns.style.display = '';
   newChallenge();
@@ -1915,6 +2049,8 @@ function setupPracticeMode() {
  * ============================================================ */
 function setMode(mode) {
   if (modeInitialized && mode === MODE) return;
+  if (modeInitialized && !confirmPracticeReplacement('离开练习')) return;
+  closeIntro(false);
   if (modeInitialized && MODE === 'build') {
     saveCurrentBuild(false);
     freeHistory = buildHistory;
@@ -1936,6 +2072,8 @@ function setMode(mode) {
   var viewBtns = document.getElementById('view-btns');
   var buildPad = document.getElementById('build-pad');
   var switcherSlot = document.getElementById('practice-switcher-slot');
+  document.getElementById('projection-actions').hidden = mode !== 'practice';
+  if (mode !== 'practice') document.getElementById('projection-actions').innerHTML = '';
 
   // 先隐藏/清理不需要的元素
   switcherSlot.hidden = mode !== 'practice';
@@ -1945,7 +2083,7 @@ function setMode(mode) {
 
   if (mode === 'learn') {
     toolbar.innerHTML = difficultyControlMarkup('learn-difficulty', learnDifficulty, '随机观察难度') +
-      '<button class="tbtn primary" id="learn-random">换一组</button>' +
+      '<button class="tbtn primary" id="learn-random">随机换模型</button>' +
       '<select id="learn-example" class="template-select" aria-label="观察范例"><option value="">随机模型</option>' +
       ModelLibrary.list().map(function (item) { return '<option value="' + item.id + '">' + item.name + '</option>'; }).join('') + '</select>' +
       '<button class="tbtn teal" id="learn-practice">用这个模型练习</button>';
@@ -2087,31 +2225,31 @@ function init() {
   });
 
   var fullscreenButton = document.getElementById('fullscreen-btn');
-  var stage = document.querySelector('.stage');
+  var fullscreenWorkspace = document.getElementById('workspace');
   function updateFullscreenButton(active) {
     fullscreenButton.title = active ? '退出全屏' : '全屏显示';
     fullscreenButton.setAttribute('aria-label', fullscreenButton.title);
     setTimeout(onResize, 50);
   }
   function setFallbackFullscreen(active) {
-    stage.classList.toggle('is-expanded', active);
+    fullscreenWorkspace.classList.toggle('is-expanded', active);
     document.body.classList.toggle('stage-expanded', active);
     updateFullscreenButton(active);
   }
   fullscreenButton.addEventListener('click', function () {
     if (document.fullscreenElement) {
       document.exitFullscreen();
-    } else if (stage.classList.contains('is-expanded')) {
+    } else if (fullscreenWorkspace.classList.contains('is-expanded')) {
       setFallbackFullscreen(false);
-    } else if (stage.requestFullscreen) {
-      var request = stage.requestFullscreen();
+    } else if (fullscreenWorkspace.requestFullscreen) {
+      var request = fullscreenWorkspace.requestFullscreen();
       if (request && request.catch) request.catch(function () { setFallbackFullscreen(true); });
     } else {
       setFallbackFullscreen(true);
     }
   });
   document.addEventListener('fullscreenchange', function () {
-    updateFullscreenButton(document.fullscreenElement === stage);
+    updateFullscreenButton(document.fullscreenElement === fullscreenWorkspace);
   });
 
   document.getElementById('sound-btn').addEventListener('click', function () {
@@ -2126,6 +2264,13 @@ function init() {
   // 音频需用户手势，在首次交互时初始化
   document.addEventListener('pointerdown', ensureAudio, { once: true });
   document.getElementById('help-btn').addEventListener('click', openTutorial);
+  document.getElementById('intro-start').addEventListener('click', openIntro);
+  document.getElementById('intro-close').addEventListener('click', function () { closeIntro(true); });
+  document.getElementById('intro-prev').addEventListener('click', function () { if (introStep > 0) { introStep--; showIntroStep(); } });
+  document.getElementById('intro-next').addEventListener('click', function () {
+    if (introStep === 2) closeIntro(true);
+    else { introStep++; showIntroStep(); }
+  });
   document.querySelectorAll('button[data-projection]').forEach(function (button) {
     button.addEventListener('click', function () { selectProjection(this.dataset.projection); });
   });
@@ -2156,9 +2301,10 @@ function init() {
       return;
     }
     if (event.key === 'Escape') {
+      if (!document.getElementById('intro-guide').hidden) closeIntro(true);
       if (sectionState.enabled) setSectionEnabled(false);
       setSizeEditorOpen(false);
-      if (document.querySelector('.stage').classList.contains('is-expanded')) setFallbackFullscreen(false);
+      if (document.getElementById('workspace').classList.contains('is-expanded')) setFallbackFullscreen(false);
       return;
     }
     if (!isBuildLikeMode() || /INPUT|TEXTAREA|SELECT/.test(event.target.tagName) || event.target.isContentEditable) return;
