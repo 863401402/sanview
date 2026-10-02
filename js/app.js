@@ -1,6 +1,6 @@
 /* ============================================================
- * 积木三视图乐园 · app.js  v2 — 全面修复版
- * 纯正方体堆叠 · 三视图教学 · 自定义搭建 · 手机+电脑
+ * 积木三视图实验室 · 浏览器场景与交互协调
+ * 投影算法、学习记录与作品校验分别由独立模块负责。
  * ============================================================ */
 (function () {
 'use strict';
@@ -9,9 +9,11 @@
 var GRID_W = 4, GRID_D = 4, MAX_H = 4, CUBE_SIZE = 1;
 var Coordinates = window.SanviewCoordinates;
 var SectionGeometry = window.SanviewSectionGeometry;
+var Learning = window.SanviewLearning;
+var ModelLibrary = window.SanviewModelLibrary;
 
 if (!Coordinates || typeof Coordinates.generateAdaptiveStructure !== 'function' ||
-    !SectionGeometry || typeof SectionGeometry.boxPlanePolygon !== 'function') {
+    !SectionGeometry || typeof SectionGeometry.boxPlanePolygon !== 'function' || !Learning || !ModelLibrary) {
   throw new Error('三视图核心模块版本不一致，请刷新页面后重试。');
 }
 
@@ -22,17 +24,30 @@ var LAYER_COLORS = [
 
 var soundOn = true;
 var MODE = 'learn';
+var modeInitialized = false;
 var cubes = new Map();
 var practiceMode = 'draw';
 var practiceAnswer = null;
 var practiceDrawn = null;
 var challengeAnswer = null;
 var challengeMatch = { front: false, left: false, top: false };
-var difficulty = 1;
+var difficulty = 0;
 var learnDifficulty = 0;
 var buildTool = 'add';
 var buildHistory = [];
-var score = { win: 0, total: 0 };
+var buildRedo = [];
+var localStore = null;
+try { localStore = window.localStorage; } catch (error) {}
+var storage = Learning.createStorage(localStore);
+var progress = storage.loadProgress();
+var savedBuild = storage.loadBuild();
+var freeBuild = savedBuild;
+var freeHistory = [], freeRedo = [];
+var questionSequence = 0;
+var questionId = '', questionAssisted = false;
+var sessionId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+var previousDialogFocus = null;
+var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 var DIFFICULTY_NAMES = ['简单', '中等', '困难', '挑战'];
 
 /* ============================================================
@@ -62,6 +77,7 @@ function initThree() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(w, h);
   container.appendChild(renderer.domElement);
+  renderer.domElement.setAttribute('aria-label', '可旋转的立体积木模型；也可使用视角按钮和俯视搭建盘操作');
 
   scene = new THREE.Scene();
 
@@ -113,6 +129,7 @@ function initThree() {
   buildBase();
   addDirectionLabels();
   window.addEventListener('resize', onResize);
+  if (window.ResizeObserver) new ResizeObserver(onResize).observe(container);
 }
 
 function buildBase() {
@@ -517,16 +534,9 @@ function applyDimensions(size) {
   }
 
   var previous = snapshotBuild();
-  GRID_W = size;
-  MAX_H = size;
-  GRID_D = size;
-  clearCubes();
-  buildBase();
-  addDirectionLabels();
-  updateSectionPlane();
-  controls.maxDistance = Math.max(18, Math.max(GRID_W, GRID_D, MAX_H) * 4);
-  onResize();
-  document.querySelector('#size-toggle strong').textContent = String(size);
+  var previousSize = GRID_W;
+  if (MODE === 'build') rememberBuild();
+  resizeSpace(size);
   setSizeEditorOpen(false);
 
   if (MODE === 'learn') {
@@ -538,10 +548,29 @@ function applyDimensions(size) {
     previous.forEach(function (c) {
       if (Coordinates.inBounds(c[0], c[1], c[2], GRID_W, GRID_D, MAX_H)) addCube(c[0], c[1], c[2], false);
     });
-    buildHistory = [];
     afterBuildAction();
     flyTo('iso');
+    if (size < previousSize) setWorkspaceStatus('空间已缩小，超出边界的积木已收起。点击撤销可恢复完整作品。');
   }
+}
+
+// Resize without generating a question or overwriting a saved work.
+function resizeSpace(size) {
+  GRID_W = size;
+  MAX_H = size;
+  GRID_D = size;
+  clearCubes();
+  buildBase();
+  addDirectionLabels();
+  updateSectionPlane();
+  controls.maxDistance = Math.max(18, Math.max(GRID_W, GRID_D, MAX_H) * 4);
+  onResize();
+  document.querySelector('#size-toggle strong').textContent = String(size);
+  document.querySelectorAll('.size-options button').forEach(function (button) {
+    var active = Number(button.dataset.size) === size;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
 }
 
 /* ---------- 方块管理 ---------- */
@@ -564,7 +593,7 @@ function addCube(x, y, z, animate) {
   cubeGroup.add(mesh);
   cubes.set(key, { x: x, y: y, z: z, mesh: mesh, color: cubeColor(y) });
 
-  if (animate !== false) {
+  if (animate !== false && !reduceMotion) {
     mesh.scale.set(0.01, 0.01, 0.01);
     mesh.position.y += 2.2;
     animateIn(mesh, center.x, center.y, center.z);
@@ -576,6 +605,7 @@ function addCube(x, y, z, animate) {
 function animateIn(mesh, tx, ty, tz) {
   var sy = mesh.position.y, t = 0, dur = 350, start = null;
   function step(ts) {
+    if (mesh.parent !== cubeGroup || mesh.userData.removing) return;
     if (!start) start = ts;
     t = Math.min(1, (ts - start) / dur);
     var e = 1 - Math.pow(1 - t, 3);
@@ -594,10 +624,12 @@ function removeCube(x, y, z, animate) {
   var c = cubes.get(key);
   if (!c) return;
   cubes.delete(key);
+  c.mesh.userData.removing = true;
   requestSectionCapUpdate();
-  if (animate !== false) {
+  if (animate !== false && !reduceMotion) {
     var mesh = c.mesh, sy = mesh.position.y, t = 0, dur = 220, start = null;
     function step(ts) {
+      if (mesh.parent !== cubeGroup) return;
       if (!start) start = ts;
       t = Math.min(1, (ts - start) / dur);
       var e = t * t;
@@ -612,8 +644,7 @@ function removeCube(x, y, z, animate) {
 }
 
 function clearCubes() {
-  var keys = Array.from(cubes.keys());
-  keys.forEach(function (k) { var c = cubes.get(k); if (c) cubeGroup.remove(c.mesh); });
+  while (cubeGroup.children.length) cubeGroup.remove(cubeGroup.children[0]);
   cubes.clear();
   highlightMesh.visible = false;
   requestSectionCapUpdate();
@@ -730,6 +761,8 @@ function renderInteractive(id, viewName, cols, rows) {
   for (var i = 0; i < cells.length; i++) {
     cells[i].addEventListener('click', function () {
       this.classList.remove('miss', 'wrong');
+      this.removeAttribute('aria-invalid');
+      this.removeAttribute('aria-description');
       this.style.outline = '';
       this.style.borderColor = '';
       this.classList.toggle('filled');
@@ -739,6 +772,8 @@ function renderInteractive(id, viewName, cols, rows) {
       if (practiceDrawn) {
         updateDrawnFromDOM();
         updateStatusSummary();
+        document.getElementById('card-' + viewName).classList.remove('win', 'fail');
+        document.getElementById('info-' + viewName).textContent = '已修改，点击检查确认';
       }
     });
   }
@@ -801,6 +836,7 @@ function flyTo(viewName) {
   var tt = new THREE.Vector3(v.target[0], v.target[1], v.target[2]);
   var tu = new THREE.Vector3(v.up[0], v.up[1], v.up[2]);
   var start = null, dur = 680;
+  if (reduceMotion) dur = 1;
   function step(ts) {
     if (!start) start = ts;
     var t = Math.min(1, (ts - start) / dur);
@@ -827,24 +863,43 @@ function isBuildLikeMode() {
 
 function setupPicking() {
   var el = renderer.domElement;
+  var pointers = new Set(), multiTouch = false;
   el.addEventListener('contextmenu', function (e) {
     if (isBuildLikeMode()) e.preventDefault();
   });
   el.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 2) return;
+    pointers.add(e.pointerId);
+    if (pointers.size > 1) multiTouch = true;
     if (e.pointerType === 'mouse' && isBuildLikeMode() && (e.button === 0 || e.button === 2)) {
       selectBuildTool(e.button === 2 ? 'remove' : 'add', false);
     }
-    pDown = { x: e.clientX, y: e.clientY, button: e.button };
+    pDown = { x: e.clientX, y: e.clientY, button: e.button, id: e.pointerId };
     pTime = Date.now();
   });
   el.addEventListener('pointerup', function (e) {
+    pointers.delete(e.pointerId);
+    if (multiTouch) {
+      pDown = null;
+      if (!pointers.size) multiTouch = false;
+      return;
+    }
     if (!pDown) return;
     var dx = e.clientX - pDown.x, dy = e.clientY - pDown.y, dt = Date.now() - pTime;
-    var sameButton = pDown.button === e.button;
+    var sameButton = pDown.button === e.button && pDown.id === e.pointerId;
     pDown = null;
     if (sameButton && Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 1200) {
       handleTap(e);
     }
+  });
+  el.addEventListener('pointercancel', function (event) {
+    pointers.delete(event.pointerId);
+    pDown = null;
+    if (!pointers.size) multiTouch = false;
+  });
+  el.addEventListener('pointerleave', function () {
+    highlightMesh.visible = false;
+    renderRequested = true;
   });
   // hover 高亮
   el.addEventListener('pointermove', function (e) {
@@ -912,12 +967,23 @@ function handleTap(e) {
   if (!isBuildLikeMode()) return;
   var target = getBuildTarget(e);
   if (!target) return;
-  var before = snapshotBuild(), changed;
-  if (buildTool === 'add') changed = !!addCube(target.x, target.y, target.z);
-  else changed = !!cubes.get(target.x + ',' + target.y + ',' + target.z);
-  if (buildTool === 'remove' && changed) removeCube(target.x, target.y, target.z);
-  if (!changed) return;
-  buildHistory.push(before);
+  var key = target.x + ',' + target.y + ',' + target.z;
+  if (buildTool === 'add') {
+    if (cubes.has(key)) return;
+    if (target.y > 0 && !cubes.has(target.x + ',' + (target.y - 1) + ',' + target.z)) {
+      setWorkspaceStatus('这块积木需要支撑，请先搭好下面一层。');
+      return;
+    }
+  } else {
+    if (!cubes.has(key)) return;
+    if (cubes.has(target.x + ',' + (target.y + 1) + ',' + target.z)) {
+      setWorkspaceStatus('上面还有积木，请从最上方开始移除。');
+      return;
+    }
+  }
+  rememberBuild();
+  if (buildTool === 'add') addCube(target.x, target.y, target.z);
+  else removeCube(target.x, target.y, target.z);
   afterBuildAction();
   playSound(buildTool === 'add' ? 'place' : 'pop');
 }
@@ -927,19 +993,46 @@ function snapshotBuild() {
 }
 
 function restoreBuild(snapshot) {
+  var resized = snapshot.size !== GRID_W;
+  if (resized) resizeSpace(snapshot.size);
   clearCubes();
-  snapshot.forEach(function (c) { addCube(c[0], c[1], c[2], false); });
+  snapshot.cubes.forEach(function (c) { addCube(c[0], c[1], c[2], false); });
   afterBuildAction();
+  if (resized) flyTo('iso');
+}
+
+function captureBuild() {
+  return { version: 1, size: GRID_W, cubes: snapshotBuild() };
+}
+
+function rememberBuild() {
+  buildHistory.push(captureBuild());
+  if (buildHistory.length > 80) buildHistory.shift();
+  buildRedo = [];
+}
+
+function undoBuild() {
+  if (!isBuildLikeMode() || !buildHistory.length) return;
+  buildRedo.push(captureBuild());
+  restoreBuild(buildHistory.pop());
+  playSound('pop');
+}
+
+function redoBuild() {
+  if (!isBuildLikeMode() || !buildRedo.length) return;
+  buildHistory.push(captureBuild());
+  restoreBuild(buildRedo.pop());
+  playSound('place');
 }
 
 function applyBuildAt(x, z) {
   var tool = arguments.length > 2 ? arguments[2] : buildTool;
   var height = columnHeight(x, z);
   if (tool === 'add' && height < MAX_H) {
-    buildHistory.push(snapshotBuild());
+    rememberBuild();
     addCube(x, height, z);
   } else if (tool === 'remove' && height > 0) {
-    buildHistory.push(snapshotBuild());
+    rememberBuild();
     removeCube(x, height - 1, z);
   } else {
     return;
@@ -957,6 +1050,102 @@ function afterBuildAction() {
   }
   updateBuildCount();
   renderBuildPad();
+  if (MODE === 'build') saveCurrentBuild(false);
+}
+
+/* ---------- 本地作品与学习记录 ---------- */
+function setWorkspaceStatus(message) {
+  document.getElementById('workspace-status').textContent = message;
+}
+
+function saveCurrentBuild(announce) {
+  if (MODE !== 'build') return;
+  freeBuild = captureBuild();
+  var saved = storage.saveBuild(freeBuild);
+  savedBuild = freeBuild;
+  document.getElementById('build-resume').hidden = false;
+  if (announce || !saved) setWorkspaceStatus(saved ? '作品已保存在此浏览器。也可以导出文件，在其他设备继续搭建。' : '浏览器无法保存作品，请导出文件备份；当前页面仍可继续搭建。');
+}
+
+function startQuestion() {
+  questionId = sessionId + '-' + (++questionSequence);
+  questionAssisted = false;
+  setWorkspaceStatus('');
+}
+
+function recordPractice(solved) {
+  progress = Learning.recordResult(progress, { questionId: questionId, mode: practiceMode, solved: solved, assisted: questionAssisted });
+  if (!storage.saveProgress(progress)) setWorkspaceStatus('浏览器无法保存练习记录，本次仍可正常练习。');
+  updateScore();
+}
+
+function updateMission() {
+  var task = MODE === 'practice' ? practiceMode : MODE;
+  var missions = {
+    learn: ['从不同方向，观察同一个模型', '选择范例或随机生成模型，切换视角、调整空间，也可以用当前模型开始练习。'],
+    draw: ['观察模型，画出三幅投影', '填写各方向能看到的格子。＋表示漏填，×表示多填；颜色不影响判题。'],
+    challenge: ['根据三视图，还原一种空间结构', '先确定占地，再调整高度。三幅投影一致即可通过，允许不同的正确搭法。'],
+    build: ['自由搭建，实时对照三视图', '增减积木、切换方向或剖切探索。作品自动保存在此浏览器，支持撤销与导出。']
+  };
+  document.getElementById('mission-title').textContent = missions[task][0];
+  document.getElementById('mission-description').textContent = missions[task][1];
+  var prompts = {
+    learn: '先问：“如果站到模型前面，你觉得会看到几格？”听孩子说理由，再点击“前”一起验证。',
+    draw: '先让孩子说一行或一列应该画几格，再自己点格子。遇到错误，问“这一格从哪个方向能看到？”不要急着看答案。',
+    challenge: '先问：“从上面看，有哪些位置放了积木？”从底层开始搭，再用正视图和左视图调整高度。',
+    build: '请孩子先搭一个小模型。只增减一块，再问“哪一幅图变了？哪一幅没变？为什么？”'
+  };
+  document.getElementById('parent-prompt').textContent = prompts[task];
+}
+
+function selectProjection(view) {
+  if (['front', 'left', 'top'].indexOf(view) < 0) return;
+  document.body.dataset.activeProjection = view;
+  refreshProjectionTabs();
+}
+
+function refreshProjectionTabs() {
+  var names = { front: '正视图', left: '左视图', top: '俯视图' };
+  var active = document.body.dataset.activeProjection || 'front';
+  document.querySelectorAll('button[data-projection]').forEach(function (button) {
+    var view = button.dataset.projection;
+    button.setAttribute('aria-pressed', String(view === active));
+    var matched = document.getElementById('card-' + view).classList.contains('win');
+    button.textContent = names[view] + (matched ? ' ✓' : '');
+  });
+}
+
+function exportBuild() {
+  var blob = new Blob([Learning.serializeBuild(captureBuild())], { type: 'application/json' });
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = 'sanview-' + GRID_W + 'x' + GRID_W + '-' + new Date().toISOString().slice(0, 10) + '.json';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  setWorkspaceStatus('作品文件已准备下载，可通过“导入”在其他设备打开。');
+}
+
+function importBuildFile(event) {
+  var file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > 65536) { setWorkspaceStatus('文件过大，请选择小于 64 KB 的积木作品 JSON 文件。'); return; }
+  var reader = new FileReader();
+  reader.onerror = function () { setWorkspaceStatus('文件读取失败，请重新选择。'); };
+  reader.onload = function () {
+    try {
+      var model = Learning.parseBuild(String(reader.result));
+      if (MODE !== 'build') setMode('build');
+      rememberBuild();
+      restoreBuild(model);
+      flyTo('iso');
+      setWorkspaceStatus('已导入 ' + model.cubes.length + ' 块积木。点击撤销可以恢复导入前的作品。');
+    } catch (error) { setWorkspaceStatus(error.message); }
+  };
+  reader.readAsText(file);
 }
 
 /* ============================================================
@@ -1056,6 +1245,9 @@ function randomSupportedStructure(level) {
 }
 
 function loadRandomObservation(announce) {
+  var exampleSelect = document.getElementById('learn-example');
+  if (exampleSelect) exampleSelect.value = '';
+  updateMission();
   clearCubes();
   var struct = randomSupportedStructure(learnDifficulty);
   struct.forEach(function (c) { addCube(c[0], c[1], c[2], false); });
@@ -1064,6 +1256,19 @@ function loadRandomObservation(announce) {
   setHintVisible(true);
   flyTo('iso');
   if (announce === true) speakKey('observe_new');
+}
+
+function loadExample(id) {
+  if (!id) { loadRandomObservation(); return; }
+  var model = ModelLibrary.create(id, GRID_W);
+  clearCubes();
+  model.cubes.forEach(function (cube) { addCube(cube[0], cube[1], cube[2], false); });
+  renderViews('learn');
+  updateStatusSummary();
+  var example = ModelLibrary.list().find(function (item) { return item.id === id; });
+  document.getElementById('mission-description').textContent = example.tip;
+  document.getElementById('parent-prompt').textContent = '请孩子先猜正视图、左视图和俯视图分别是什么形状，再切换方向验证。' + example.tip;
+  flyTo('iso');
 }
 
 function setHintVisible(v) {
@@ -1089,6 +1294,7 @@ function updateStatusSummary() {
     text = '自由搭建 · 空间 ' + GRID_W + ' · ' + cubes.size + ' 块';
   }
   document.getElementById('hint').textContent = text;
+  refreshProjectionTabs();
   setHintVisible(true);
 }
 
@@ -1099,14 +1305,17 @@ function randomPracticeStructure() {
   return randomSupportedStructure(difficulty);
 }
 
-function newPractice(announce) {
+function newPractice(announce, structure) {
+  startQuestion();
+  clearViewFeedback();
   clearCubes();
-  var struct = randomPracticeStructure();
+  var struct = structure || randomPracticeStructure();
   struct.forEach(function (c) { addCube(c[0], c[1], c[2], false); });
 
   practiceAnswer = viewMask(computeViews());
   practiceDrawn = { front: [], left: [], top: [] };
   renderViews('practice');
+  setInfo(['请填出正视投影', '请填出左视投影', '请填出俯视投影']);
   updateStatusSummary();
   flyTo('iso');
   if (announce === true) speakKey('draw_new');
@@ -1115,46 +1324,68 @@ function newPractice(announce) {
 function checkPractice() {
   if (!practiceAnswer) return;
   updateDrawnFromDOM();
-  var answer = practiceAnswer, allCorrect = true, firstFail = null;
+  var answer = practiceAnswer, allCorrect = true, firstFail = null, feedback = [];
 
   [['grid-front', 'front'], ['grid-left', 'left'], ['grid-top', 'top']].forEach(function (pair) {
     var cells = document.getElementById(pair[0]).children;
     var ans = answer[pair[1]], drew = practiceDrawn[pair[1]];
+    var missing = 0, extra = 0;
     for (var i = 0; i < cells.length; i++) {
       // 清除上次标记
       cells[i].classList.remove('miss', 'wrong', 'correct-mark');
       cells[i].style.outline = '';
       cells[i].style.borderColor = '';
+      cells[i].removeAttribute('aria-invalid');
+      cells[i].removeAttribute('aria-description');
       var fill = cells[i].classList.contains('filled');
       if (ans[i] && !fill) {
         cells[i].classList.add('miss'); cells[i].style.background = '#FF6B6B';
+        cells[i].setAttribute('aria-invalid', 'true');
+        cells[i].setAttribute('aria-description', '漏填，请补上这一格');
+        missing++;
         allCorrect = false; if (!firstFail) firstFail = pair[1];
       } else if (!ans[i] && fill) {
         cells[i].classList.add('wrong'); cells[i].style.background = '#FF6B6B';
+        cells[i].setAttribute('aria-invalid', 'true');
+        cells[i].setAttribute('aria-description', '多填，请取消这一格');
+        extra++;
         allCorrect = false; if (!firstFail) firstFail = pair[1];
       } else if (ans[i] && fill) {
         cells[i].style.outline = '3px solid #51CF66';
       }
     }
+    var matched = missing + extra === 0;
+    var card = document.getElementById('card-' + pair[1]);
+    card.classList.toggle('win', matched);
+    card.classList.toggle('fail', !matched);
+    feedback.push(matched ? '<b>这一幅画对了</b>' : '漏填 ' + missing + ' 格 · 多填 ' + extra + ' 格');
   });
-
-  score.total++;
+  setInfo(feedback);
+  recordPractice(allCorrect);
   if (allCorrect) {
-    score.win++;
     playSound('win');
     speakKey('draw_success');
     showWinOverlay();
     document.getElementById('hint').textContent = '🎉 太厉害了！全对！';
   } else {
     playSound('pop');
-    if (firstFail) speakKey('draw_retry_' + firstFail);
-    document.getElementById('hint').textContent = '😊 还有小错误，看看红色格子，改一改再试试～';
+    if (firstFail) {
+      speakKey('draw_retry_' + firstFail);
+      selectProjection(firstFail);
+      var invalidCell = document.querySelector('#card-' + firstFail + ' [aria-invalid="true"]');
+      if (invalidCell) invalidCell.focus({ preventScroll: true });
+      document.getElementById('card-' + firstFail).scrollIntoView({ block: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
+    }
+    document.getElementById('hint').textContent = '＋需要补上，×需要取消；对照模型再试一次。';
   }
   updateScore();
+  refreshProjectionTabs();
 }
 
 function showAnswer() {
   if (!practiceAnswer) return;
+  questionAssisted = true;
+  recordPractice(false);
   var map = { front: 'grid-front', left: 'grid-left', top: 'grid-top' };
   Object.keys(map).forEach(function (k) {
     var cells = document.getElementById(map[k]).children;
@@ -1162,6 +1393,8 @@ function showAnswer() {
       cells[i].classList.remove('miss', 'wrong');
       cells[i].style.outline = '';
       cells[i].style.borderColor = '';
+      cells[i].removeAttribute('aria-invalid');
+      cells[i].removeAttribute('aria-description');
       if (v) { cells[i].classList.add('filled'); cells[i].style.background = '#51CF66'; }
       else { cells[i].classList.remove('filled'); cells[i].style.background = ''; }
       cells[i].setAttribute('aria-pressed', String(v));
@@ -1170,10 +1403,13 @@ function showAnswer() {
   });
   updateDrawnFromDOM();
   updateStatusSummary();
+  setWorkspaceStatus('已显示答案。本题记为参考学习，不计入独立完成；可以换一道新题试试。');
   speakKey('answer_reveal');
 }
 
 function clearDrawing() {
+  clearViewFeedback();
+  setInfo(['请填出正视投影', '请填出左视投影', '请填出俯视投影']);
   ['grid-front', 'grid-left', 'grid-top'].forEach(function (id) {
     var cells = document.getElementById(id).children;
     for (var i = 0; i < cells.length; i++) {
@@ -1181,6 +1417,8 @@ function clearDrawing() {
       cells[i].style.background = '';
       cells[i].style.outline = '';
       cells[i].style.borderColor = '';
+      cells[i].removeAttribute('aria-invalid');
+      cells[i].removeAttribute('aria-description');
       cells[i].setAttribute('aria-pressed', 'false');
       cells[i].setAttribute('aria-label', cells[i].getAttribute('aria-label').replace(/，(未涂色|已涂色)$/, '，未涂色'));
     }
@@ -1199,8 +1437,11 @@ function sameMask(left, right) {
 }
 
 function newChallenge(announce) {
+  startQuestion();
+  clearViewFeedback();
   clearCubes();
   buildHistory = [];
+  buildRedo = [];
   challengeAnswer = viewMask(computeStructureViews(randomPracticeStructure()));
   challengeMatch = { front: false, left: false, top: false };
   renderViews('challenge');
@@ -1231,9 +1472,9 @@ function updateChallengeProgress(showErrors) {
 }
 
 function checkChallenge() {
-  score.total++;
-  if (updateChallengeProgress(true)) {
-    score.win++;
+  var solved = updateChallengeProgress(true);
+  recordPractice(solved);
+  if (solved) {
     playSound('win');
     speakKey('challenge_success');
     showWinOverlay('challenge');
@@ -1245,20 +1486,25 @@ function checkChallenge() {
 }
 
 function updateScore() {
+  var summary = Learning.summarizeProgress(progress);
   var el = document.getElementById('score-text');
-  if (el) el.textContent = '⭐ ' + score.win + '/' + score.total;
+  if (el) el.textContent = '独立 ' + summary.independent + '/' + summary.attempted;
+  document.getElementById('progress-summary').textContent = '本机记录 · 练过 ' + summary.attempted + ' 题 · 独立完成 ' + summary.independent + ' 题';
+  document.getElementById('progress-summary').title = '保留最近 ' + Learning.MAX_PROGRESS_RECORDS + ' 题；参考答案后完成 ' + (summary.solved - summary.independent) + ' 题。用于回顾学习，不是考试成绩。';
 }
 
 /* ============================================================
  * 胜利弹窗
  * ============================================================ */
 function showWinOverlay(kind) {
+  prepareDialog();
   var challenge = kind === 'challenge';
+  var summary = Learning.summarizeProgress(progress);
   var overlay = document.getElementById('overlay');
   overlay.innerHTML = '<div class="win-box" role="dialog" aria-modal="true" aria-labelledby="win-title">' +
     '<div class="big" id="win-emoji" aria-hidden="true">✓</div>' +
     '<div class="msg" id="win-title">' + (challenge ? '三幅视图全部匹配' : '三幅视图全部画对') + '</div>' +
-    '<div class="sub" id="win-sub">已完成 ' + score.win + ' 题</div>' +
+    '<div class="sub" id="win-sub">' + (questionAssisted ? '本题为参考学习。换一道新题，试着独立完成。' : '本题独立完成！最近记录已独立完成 ' + summary.independent + ' 题。') + '</div>' +
     '<div class="dialog-actions"><button class="again" id="win-again">再来一题</button>' +
     '<button class="again secondary" id="win-close">关闭</button></div></div>';
   overlay.classList.add('show');
@@ -1278,6 +1524,16 @@ function hideWinOverlay() {
   overlay.classList.remove('show', 'tutorial-overlay');
   overlay.innerHTML = '';
   overlay.onclick = null;
+  document.body.appendChild(overlay);
+  if (previousDialogFocus && previousDialogFocus.isConnected) previousDialogFocus.focus();
+  previousDialogFocus = null;
+}
+
+function prepareDialog() {
+  var overlay = document.getElementById('overlay');
+  if (!overlay.classList.contains('show')) previousDialogFocus = document.activeElement;
+  // Dialogs must belong to the fullscreen subtree to remain visible.
+  if (document.fullscreenElement) document.fullscreenElement.appendChild(overlay);
 }
 
 var tutorialStep = 0;
@@ -1357,23 +1613,17 @@ function renderTutorialStep() {
 }
 
 function openTutorial() {
+  prepareDialog();
   activeTutorialKey = currentTutorialKey();
   tutorialStep = 0;
   renderTutorialStep();
-}
-
-function maybeShowTutorial() {
-  if (new URLSearchParams(window.location.search).get('test') === '1') return;
-  activeTutorialKey = currentTutorialKey();
-  var seen = false;
-  try { seen = window.localStorage.getItem('sanview-tutorial-seen-' + activeTutorialKey) === '1'; } catch (error) {}
-  if (!seen) openTutorial();
 }
 
 /* ============================================================
  * 彩带
  * ============================================================ */
 function confettiBurst() {
+  if (reduceMotion) return;
   var wrap = document.getElementById('confetti-canvas-wrap');
   var canvas = document.getElementById('confetti-canvas');
   wrap.style.display = 'block';
@@ -1422,10 +1672,13 @@ function bindDifficultyControl(id, getValue, onChange) {
     var value = getValue();
     var label = document.getElementById(id);
     if (label) label.textContent = DIFFICULTY_NAMES[value];
+    document.querySelectorAll('[data-difficulty="' + id + '"]').forEach(function (button) {
+      button.disabled = Number(button.dataset.step) < 0 ? value === 0 : value === DIFFICULTY_NAMES.length - 1;
+    });
   }
   document.querySelectorAll('[data-difficulty="' + id + '"]').forEach(function (button) {
     button.addEventListener('click', function () {
-      var next = (getValue() + parseInt(this.dataset.step, 10) + DIFFICULTY_NAMES.length) % DIFFICULTY_NAMES.length;
+      var next = Math.max(0, Math.min(DIFFICULTY_NAMES.length - 1, getValue() + parseInt(this.dataset.step, 10)));
       onChange(next);
       refresh();
     });
@@ -1441,7 +1694,7 @@ function practiceSwitcherMarkup() {
 }
 
 function bindPracticeSwitcher() {
-  document.querySelectorAll('[data-practice-mode]').forEach(function (button) {
+  document.querySelectorAll('button[data-practice-mode]').forEach(function (button) {
     var active = button.dataset.practiceMode === practiceMode;
     button.classList.toggle('active', active);
     button.addEventListener('click', function () {
@@ -1463,6 +1716,7 @@ function buildToolsMarkup(includeChallengeActions) {
     '<button class="tbtn remove" id="tool-remove"><span aria-hidden="true">−</span> 减少</button>' +
     '</div>' +
     '<button class="tbtn ghost icon-btn" id="tool-undo" aria-label="撤销" title="撤销">↶</button>' +
+    '<button class="tbtn ghost icon-btn" id="tool-redo" aria-label="重做" title="重做 (Ctrl+Shift+Z)">↷</button>' +
     '<button class="tbtn ghost icon-btn" id="tool-clear" aria-label="清空" title="清空">×</button>' +
     '<span class="cube-count" id="cube-count">0 块</span>';
 }
@@ -1470,14 +1724,11 @@ function buildToolsMarkup(includeChallengeActions) {
 function bindBuildToolbar() {
   document.getElementById('tool-add').addEventListener('click', function () { selectBuildTool('add', true); });
   document.getElementById('tool-remove').addEventListener('click', function () { selectBuildTool('remove', true); });
-  document.getElementById('tool-undo').addEventListener('click', function () {
-    if (!buildHistory.length) return;
-    restoreBuild(buildHistory.pop());
-    playSound('pop');
-  });
+  document.getElementById('tool-undo').addEventListener('click', undoBuild);
+  document.getElementById('tool-redo').addEventListener('click', redoBuild);
   document.getElementById('tool-clear').addEventListener('click', function () {
     if (!cubes.size) return;
-    buildHistory.push(snapshotBuild());
+    rememberBuild();
     clearCubes();
     afterBuildAction();
     speakKey('build_cleared');
@@ -1488,8 +1739,14 @@ function bindBuildToolbar() {
 
 function setupBuildToolbar() {
   var t = document.getElementById('stage-toolbar');
-  t.innerHTML = buildToolsMarkup(false);
+  t.innerHTML = buildToolsMarkup(false) + '<div class="workspace-actions" role="group" aria-label="作品文件">' +
+    '<button class="tbtn tool" id="build-save">保存</button>' +
+    '<button class="tbtn tool" id="build-export">导出</button>' +
+    '<button class="tbtn tool" id="build-import">导入</button></div>';
   bindBuildToolbar();
+  document.getElementById('build-save').addEventListener('click', function () { saveCurrentBuild(true); });
+  document.getElementById('build-export').addEventListener('click', exportBuild);
+  document.getElementById('build-import').addEventListener('click', function () { document.getElementById('build-file-input').click(); });
 }
 
 function selectBuildTool(tool, announce) {
@@ -1498,6 +1755,8 @@ function selectBuildTool(tool, announce) {
   var removeButton = document.getElementById('tool-remove');
   if (addButton) addButton.classList.toggle('on', buildTool === 'add');
   if (removeButton) removeButton.classList.toggle('on', buildTool === 'remove');
+  if (addButton) addButton.setAttribute('aria-pressed', String(buildTool === 'add'));
+  if (removeButton) removeButton.setAttribute('aria-pressed', String(buildTool === 'remove'));
   renderBuildPad();
   if (announce) speakKey(buildTool === 'add' ? 'tool_add' : 'tool_remove');
 }
@@ -1524,6 +1783,9 @@ function ensureBuildPad() {
 function renderBuildPad() {
   var grid = document.getElementById('build-pad-grid');
   if (!grid) return;
+  var focused = document.activeElement;
+  var focusX = grid.contains(focused) ? focused.dataset.x : null;
+  var focusZ = grid.contains(focused) ? focused.dataset.z : null;
   grid.innerHTML = '';
   grid.style.gridTemplateColumns = 'repeat(' + GRID_W + ', 1fr)';
   for (var z = 0; z < GRID_D; z++) {
@@ -1540,14 +1802,20 @@ function renderBuildPad() {
       grid.appendChild(button);
     }
   }
+  if (focusX !== null) {
+    var nextFocus = grid.querySelector('[data-x="' + focusX + '"][data-z="' + focusZ + '"]');
+    if (nextFocus) nextFocus.focus({ preventScroll: true });
+  }
 }
 
 function bindBuildCell(button) {
   var press = null;
   button.addEventListener('contextmenu', function (event) { event.preventDefault(); });
   button.addEventListener('pointerdown', function (event) {
+    if (event.pointerType === 'mouse' && event.button !== 0 && event.button !== 2) return;
     press = { x: event.clientX, y: event.clientY, time: Date.now(), button: event.button, pointerType: event.pointerType };
   });
+  button.addEventListener('pointercancel', function () { press = null; });
   button.addEventListener('pointerup', function (event) {
     if (!press || press.button !== event.button) return;
     var dx = event.clientX - press.x, dy = event.clientY - press.y;
@@ -1561,8 +1829,20 @@ function bindBuildCell(button) {
   });
   button.addEventListener('click', function (event) {
     if (event.detail !== 0) return;
-    selectBuildTool('add', false);
-    applyBuildAt(parseInt(this.dataset.x, 10), parseInt(this.dataset.z, 10), 'add');
+    applyBuildAt(parseInt(this.dataset.x, 10), parseInt(this.dataset.z, 10), buildTool);
+  });
+  button.addEventListener('keydown', function (event) {
+    var x = Number(this.dataset.x), z = Number(this.dataset.z);
+    if (event.key === 'Delete' || event.key === 'Backspace') {
+      event.preventDefault();
+      applyBuildAt(x, z, 'remove');
+      return;
+    }
+    var offsets = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    if (!offsets[event.key]) return;
+    event.preventDefault();
+    var next = document.querySelector('.build-cell[data-x="' + (x + offsets[event.key][0]) + '"][data-z="' + (z + offsets[event.key][1]) + '"]');
+    if (next) next.focus();
   });
 }
 
@@ -1572,6 +1852,8 @@ function updateBuildCount() {
   if (el) el.textContent = n + ' 块';
   var undo = document.getElementById('tool-undo');
   if (undo) undo.disabled = buildHistory.length === 0;
+  var redo = document.getElementById('tool-redo');
+  if (redo) redo.disabled = buildRedo.length === 0;
   updateStatusSummary();
 }
 
@@ -1582,6 +1864,8 @@ function clearViewFeedback() {
 }
 
 function setupPracticeMode() {
+  document.body.dataset.practiceMode = practiceMode;
+  updateMission();
   var toolbar = document.getElementById('stage-toolbar');
   var switcherSlot = document.getElementById('practice-switcher-slot');
   var viewBtns = document.getElementById('view-btns');
@@ -1598,7 +1882,8 @@ function setupPracticeMode() {
       '<button class="tbtn primary" id="practice-check">检查</button>' +
       '<button class="tbtn tool" id="practice-answer">答案</button>' +
       '<button class="tbtn ghost" id="practice-clear">重画</button>' +
-      '<span class="stars" id="score-text">' + score.win + '/' + score.total + '</span>';
+      '<span class="stars" id="score-text"></span>';
+    updateScore();
     bindDifficultyControl('practice-difficulty', function () { return difficulty; }, function (value) {
       difficulty = value;
       newPractice();
@@ -1609,7 +1894,6 @@ function setupPracticeMode() {
     document.getElementById('practice-clear').addEventListener('click', clearDrawing);
     viewBtns.style.display = 'none';
     newPractice();
-    maybeShowTutorial();
     return;
   }
 
@@ -1623,14 +1907,25 @@ function setupPracticeMode() {
   document.getElementById('challenge-check').addEventListener('click', checkChallenge);
   viewBtns.style.display = '';
   newChallenge();
-  maybeShowTutorial();
+  selectBuildTool('add', false);
 }
 
 /* ============================================================
  * 模式切换
  * ============================================================ */
 function setMode(mode) {
+  if (modeInitialized && mode === MODE) return;
+  if (modeInitialized && MODE === 'build') {
+    saveCurrentBuild(false);
+    freeHistory = buildHistory;
+    freeRedo = buildRedo;
+  }
+  modeInitialized = true;
   MODE = mode;
+  document.body.dataset.mode = mode;
+  document.body.dataset.practiceMode = practiceMode;
+  updateMission();
+  setWorkspaceStatus('');
   document.querySelectorAll('.tab').forEach(function (t) {
     var active = t.dataset.mode === mode;
     t.classList.toggle('active', active);
@@ -1650,27 +1945,42 @@ function setMode(mode) {
 
   if (mode === 'learn') {
     toolbar.innerHTML = difficultyControlMarkup('learn-difficulty', learnDifficulty, '随机观察难度') +
-      '<button class="tbtn primary" id="learn-random">换一组</button>';
+      '<button class="tbtn primary" id="learn-random">换一组</button>' +
+      '<select id="learn-example" class="template-select" aria-label="观察范例"><option value="">随机模型</option>' +
+      ModelLibrary.list().map(function (item) { return '<option value="' + item.id + '">' + item.name + '</option>'; }).join('') + '</select>' +
+      '<button class="tbtn teal" id="learn-practice">用这个模型练习</button>';
     bindDifficultyControl('learn-difficulty', function () { return learnDifficulty; }, function (value) {
       learnDifficulty = value;
       loadRandomObservation();
     });
     document.getElementById('learn-random').addEventListener('click', function () { loadRandomObservation(true); });
+    document.getElementById('learn-example').addEventListener('change', function () { loadExample(this.value); });
+    document.getElementById('learn-practice').addEventListener('click', function () {
+      var structure = snapshotBuild();
+      practiceMode = 'draw';
+      setMode('practice');
+      newPractice(false, structure);
+      setWorkspaceStatus('已保留刚才的模型，请在网格中画出它的三幅投影。');
+    });
     viewBtns.style.display = '';
-    loadRandomObservation();
+    document.getElementById('learn-example').value = 'stairs';
+    loadExample('stairs');
   } else if (mode === 'practice') {
     setupPracticeMode();
   } else if (mode === 'build') {
-    buildHistory = [];
+    buildHistory = freeHistory;
+    buildRedo = freeRedo;
     buildTool = 'add';
     clearCubes();
     setupBuildToolbar();
+    if (freeBuild) restoreBuild(freeBuild);
+    selectBuildTool('add', false);
     viewBtns.style.display = '';
     renderViews('build');
     updateBuildCount();
     flyTo('iso');
   }
-  if (mode !== 'practice') maybeShowTutorial();
+  updateScore();
 }
 
 /* ============================================================
@@ -1678,6 +1988,7 @@ function setMode(mode) {
  * ============================================================ */
 function animate() {
   requestAnimationFrame(animate);
+  if (document.hidden) return;
   var controlsChanged = controls.update();
   if (!renderRequested && !controlsChanged) return;
   renderer.render(scene, camera);
@@ -1694,6 +2005,7 @@ function installTestApi() {
         challengeMatch: challengeMatch,
         dimensions: [GRID_W, MAX_H, GRID_D],
         buildTool: buildTool,
+        progress: Learning.summarizeProgress(progress),
         cubes: Array.from(cubes.values()).map(function (cube) {
           return {
             x: cube.x, y: cube.y, z: cube.z,
@@ -1745,7 +2057,10 @@ function installTestApi() {
  * 初始化
  * ============================================================ */
 function init() {
-  initThree();
+  try { initThree(); } catch (error) {
+    document.getElementById('three-container').innerHTML = '<div class="render-error" role="alert"><h2>暂时无法显示立体模型</h2><p>请使用支持 WebGL 的浏览器，并尝试开启硬件加速后刷新页面。</p><button type="button" onclick="location.reload()">重新加载</button></div>';
+    return;
+  }
   setupPicking();
   setupSectionControls();
 
@@ -1811,10 +2126,50 @@ function init() {
   // 音频需用户手势，在首次交互时初始化
   document.addEventListener('pointerdown', ensureAudio, { once: true });
   document.getElementById('help-btn').addEventListener('click', openTutorial);
+  document.querySelectorAll('button[data-projection]').forEach(function (button) {
+    button.addEventListener('click', function () { selectProjection(this.dataset.projection); });
+  });
+  selectProjection('front');
+  document.getElementById('build-resume').hidden = !savedBuild;
+  document.getElementById('build-resume').addEventListener('click', function () { setMode('build'); });
+  document.getElementById('build-file-input').addEventListener('change', importBuildFile);
+  document.getElementById('progress-reset').addEventListener('click', function () {
+    if (!window.confirm('清除这个浏览器保存的练习记录？搭建作品会保留。')) return;
+    progress = Learning.createProgress();
+    var cleared = storage.clearProgress();
+    updateScore();
+    setWorkspaceStatus(cleared ? '练习记录已清除，搭建作品已保留。' : '当前记录已清空，但浏览器未允许修改存储。');
+  });
   document.addEventListener('keydown', function (event) {
-    if (event.key !== 'Escape') return;
-    if (document.getElementById('overlay').classList.contains('tutorial-overlay')) closeTutorial();
-    else if (sectionState.enabled) setSectionEnabled(false);
+    var overlay = document.getElementById('overlay');
+    if (overlay.classList.contains('show')) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (overlay.classList.contains('tutorial-overlay')) closeTutorial();
+        else hideWinOverlay();
+      } else if (event.key === 'Tab') {
+        var buttons = overlay.querySelectorAll('button:not([disabled])');
+        var first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      if (sectionState.enabled) setSectionEnabled(false);
+      setSizeEditorOpen(false);
+      if (document.querySelector('.stage').classList.contains('is-expanded')) setFallbackFullscreen(false);
+      return;
+    }
+    if (!isBuildLikeMode() || /INPUT|TEXTAREA|SELECT/.test(event.target.tagName) || event.target.isContentEditable) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+      var key = event.key.toLowerCase();
+      if (key === 'z' || key === 'y') {
+        event.preventDefault();
+        if (key === 'y' || event.shiftKey) redoBuild();
+        else undoBuild();
+      }
+    }
   });
 
   setMode('learn');

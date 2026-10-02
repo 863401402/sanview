@@ -1,0 +1,60 @@
+name: Verify and publish
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - run: npm run build
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Package Pages site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Publish verified site
+        id: deployment
+        uses: actions/deploy-pages@v4

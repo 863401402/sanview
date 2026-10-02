@@ -5,3 +5,7 @@ test-results/
 .DS_Store
 *.log
 *.source.wav
+server-source-*.tar.gz
+.env
+.env.*
+_site/

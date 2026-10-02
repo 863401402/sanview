@@ -1,13 +1,17 @@
 {
   "name": "sanview",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "面向儿童的积木三视图互动实验室",
+  "description": "通用三视图与空间探索工具：观察、绘图练习、还原积木与自由搭建",
+  "homepage": "https://863401402.github.io/sanview/",
+  "repository": { "type": "git", "url": "https://github.com/863401402/sanview.git" },
   "scripts": {
+    "start": "node scripts/serve.js",
+    "build": "node scripts/build-site.js",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:unit": "node tests/coordinates.test.js && node tests/section-geometry.test.js && node tests/voice-library.test.js",
+    "test:unit": "node tests/coordinates.test.js && node tests/section-geometry.test.js && node tests/voice-library.test.js && node tests/learning-state.test.js && node tests/model-library.test.js",
     "test:e2e": "node tests/e2e.test.js",
-    "check": "node --check js/coordinates.js && node --check js/section-geometry.js && node --check js/voice-library.js && node --check js/app.js && node --check scripts/generate-voices.js && npm run test:unit",
+    "check": "node --check js/app.js && node --check js/learning-state.js && node --check js/model-library.js && node --check scripts/serve.js && node --check scripts/build-site.js && node --check scripts/generate-voices.js && npm run test:unit",
     "voice:generate": "node scripts/generate-voices.js"
   },
   "keywords": [
